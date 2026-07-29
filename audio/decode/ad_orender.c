@@ -72,6 +72,8 @@ const struct m_sub_options ad_orender_conf = {
          * live mode is then driven by Studio over OSC. */
         {"channel-mode", OPT_CHOICE(channel_mode_idx,
             {"auto", 0}, {"host", 1}, {"spatial", 2}, {"direct", 2}, {"virtual", 2})},
+        {"output-channel-mapping", OPT_CHOICE(output_channel_mapping_idx,
+            {"auto", 0}, {"by-index", 1}, {"by-name", 2})},
         /* Which native decoder to use in host mode: "lavc" decodes to PCM (mpv's
          * audio chain applies — the default), "spdif" passes the compressed
          * bitstream through to an AV receiver. */
@@ -103,7 +105,8 @@ struct priv {
     int channels;
     struct mp_chmap chmap;
     bool checked_spatial;       // built the output chmap for the spatial path
-    int last_mapping;           // last orender_channel_mapping() the chmap was built for (live switch)
+    int output_channel_mapping_idx; // 0=live renderer setting 1=index 2=name
+    int last_mapping;           // last effective channel mapping the chmap was built for
     bool source_spatial;        // container/bridge identified object content
     bool source_classified;     // first decoded presentation has been inspected
     bool force_host;            // engine unusable (no layout / create failed): always native
@@ -303,6 +306,13 @@ static void refresh_codec_profile(struct priv *p)
     p->last_bed_sig = bed_sig;
 }
 
+static int channel_mapping(struct priv *p)
+{
+    if (p->output_channel_mapping_idx > 0)
+        return p->output_channel_mapping_idx - 1;
+    return p->dl->channel_mapping(p->renderer);
+}
+
 /* Build p->chmap from the renderer's output layout. Returns false if any
  * speaker had no mpv mapping (caller still proceeds; positions are NA). */
 static bool build_chmap(struct priv *p)
@@ -318,7 +328,7 @@ static bool build_chmap(struct priv *p)
      * layout speaker N, matching a custom rig wired in layout order. Only
      * by-name (1) builds a positional map so a position-aware sink routes by
      * speaker; <0 (error) also falls back to positionless. */
-    if (p->dl->channel_mapping(p->renderer) != 1) {
+    if (channel_mapping(p) != 1) {
         mp_chmap_set_unknown(&p->chmap, n);
         return true;
     }
@@ -532,7 +542,7 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
      * frame (AC-3/DTS need several packets to acquire sync). */
     if (!p->checked_spatial) {
         p->checked_spatial = true;
-        p->last_mapping = p->dl->channel_mapping(p->renderer);
+        p->last_mapping = channel_mapping(p);
         if (!build_chmap(p)) {
             if (p->chmap.num == 0) {
                 /* The renderer reported no output channels (e.g. the speaker
@@ -574,7 +584,7 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
      * above misses it, so poll the mapping and rebuild on change — the new chmap
      * set on the frame below makes mpv's filter chain reconfigure the output. */
     {
-        int cur_mapping = p->dl->channel_mapping(p->renderer);
+        int cur_mapping = channel_mapping(p);
         if (cur_mapping != p->last_mapping) {
             MP_VERBOSE(da, "output channel mapping changed (%d -> %d); rebuilding chmap\n",
                        p->last_mapping, cur_mapping);
@@ -757,6 +767,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
     struct ad_orender_params *opts =
         mp_get_config_group(da, da->global, &ad_orender_conf);
     p->host_decoder_idx = opts->host_decoder_idx;
+    p->output_channel_mapping_idx = opts->output_channel_mapping_idx;
 
     /* Load liborender (once per process; later calls hit the cache). On
      * failure keep the all-stubs table so every call below stays valid;
@@ -815,6 +826,13 @@ static struct mp_decoder *create(struct mp_filter *parent,
      * by Studio over OSC. */
     if (p->renderer && opts->channel_mode_idx > 0)
         p->dl->set_channel_mode(p->renderer, opts->channel_mode_idx - 1);
+
+    if (p->renderer && opts->output_channel_mapping_idx > 0) {
+        const char *mapping = opts->output_channel_mapping_idx == 1
+                            ? "by_index" : "by_name";
+        if (p->dl->set_option(p->renderer, "output_channel_mapping", mapping) < 0)
+            MP_WARN(da, "could not set output channel mapping to %s\n", mapping);
+    }
 
     if (p->renderer)
         p->channels = p->dl->channel_count(p->renderer);

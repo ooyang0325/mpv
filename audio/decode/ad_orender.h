@@ -31,6 +31,7 @@ struct ad_orender_params {
     char *osc_bind;             // listener bind address (else config/default)
     char *osc_monitor_target;   // monitoring host (else config/default)
     int channel_mode_idx;       // initial render override: 0=auto 1=host 2=spatial
+    int output_channel_mapping_idx; // 0=auto 1=by-index 2=by-name
     int host_decoder_idx;       // host-mode native decoder: 0=lavc 1=spdif
 };
 
