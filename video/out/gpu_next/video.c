@@ -16,6 +16,8 @@
 #include "video/img_format.h"              // for mp_imgfmt
 #include "video/mp_image.h"                // for mp_image, mp_image_params
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
+#include "video/out/gpu/video.h"          // for gl_video_conf, gl_video_opts
+#include "options/m_config.h"             // for m_config_cache
 #include "video/out/vo.h"                  // for vo_frame
 
 // Forward declarations
@@ -75,6 +77,9 @@ struct pl_video {
 
     // Color adjustment state
     struct mp_csp_equalizer_state *video_eq; // Manages brightness, contrast, hue, etc.
+
+    // Renderer options (--target-prim, --target-trc, --target-peak, ...).
+    struct m_config_cache *opts_cache;
 };
 
 /**
@@ -214,6 +219,7 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
 
     // Create the state object that tracks brightness, contrast, etc.
     p->video_eq = mp_csp_equalizer_create(p, global);
+    p->opts_cache = m_config_cache_alloc(p, global, &gl_video_conf);
 
     return p;
 }
@@ -370,18 +376,41 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // Describe the target surface for libplacebo.
     struct pl_frame target_frame = {
         .num_planes = 1,
-        .planes[0] = { .texture = target_tex, .components = 4, .component_mapping = {0,1,2,3} },
+        .planes[0] = {
+            .texture = target_tex,
+            // API users render into an OpenGL FBO, whose origin is bottom-left
+            // while mpv works top-left. libplacebo documents the plane flag as
+            // the correct way to express this: unlike inverting the target
+            // crop, it also flips everything composited into the target, so
+            // subtitles and OSD stay aligned with the video.
+            .flipped = flip,
+            .components = 4,
+            .component_mapping = {0,1,2,3},
+        },
         .crop = { .x0 = p->current_dst.x0, .y0 = p->current_dst.y0, .x1 = p->current_dst.x1, .y1 = p->current_dst.y1 },
         .color = pl_color_space_srgb,
         .repr = pl_color_repr_rgb,
     };
 
-    // libplacebo expresses a vertical flip as an inverted crop rectangle.
-    if (flip) {
-        float y0 = target_frame.crop.y0;
-        target_frame.crop.y0 = target_frame.crop.y1;
-        target_frame.crop.y1 = y0;
+    // Honour the target colorspace the API user asked for. They own the
+    // surface we render into and may have tagged it as something other than
+    // sRGB -- a player showing HDR on an EDR display will tag its layer as
+    // PQ/BT.2020 and set --target-trc=pq accordingly. Assuming sRGB there
+    // writes SDR values into a surface the compositor then reads as PQ, which
+    // comes out heavily oversaturated and over-contrasty.
+    m_config_cache_update(p->opts_cache);
+    const struct gl_video_opts *vopts = p->opts_cache->opts;
+    if (vopts->target_prim)
+        target_frame.color.primaries = vopts->target_prim;
+    if (vopts->target_trc)
+        target_frame.color.transfer = vopts->target_trc;
+    if (vopts->target_peak)
+        target_frame.color.hdr.max_luma = vopts->target_peak;
+    if (vopts->target_gamut) {
+        mp_parse_raw_primaries(mp_null_log, vopts->target_gamut,
+                               &target_frame.color.hdr.prim);
     }
+    pl_color_space_infer(&target_frame.color);
 
     // The libmpv VO provides one new frame at a time in frame->current.
     // We check the frame_id to avoid pushing duplicates.
@@ -442,14 +471,17 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // frame's duration is equivalent to one source frame (1.0 in normalized time).
     mix.vsync_duration = 1.0f;
 
-    // Prepare the rendering parameters for libplacebo
-    struct pl_render_params params = {
-        .upscaler = &pl_filter_nearest,
-        .downscaler = &pl_filter_nearest,
-    };
+    // Prepare the rendering parameters for libplacebo. Start from the library
+    // defaults: a zero-initialized struct is not a neutral choice, it disables
+    // peak detection, dithering and sigmoidal scaling outright, which on HDR
+    // sources leaves the tone curve unmanaged and renders them clipped,
+    // oversaturated and over-contrasty.
+    struct pl_render_params params = pl_render_default_params;
 
-    // Declare a local struct to hold the color adjustment values.
-    struct pl_color_adjustment color_adj;
+    // Declare a local struct to hold the color adjustment values, starting
+    // neutral so that fields the equalizer does not drive (temperature) are
+    // defined rather than whatever was on the stack.
+    struct pl_color_adjustment color_adj = pl_color_adjustment_neutral;
 
     // Query the current brightness/contrast/etc values from the equalizer
     struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
@@ -540,10 +572,9 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
     update_overlays(p, osd_res, 0, PL_OVERLAY_COORDS_DST_FRAME,
                     &p->osd_state_storage, &target_frame, frame->current);
 
-    const struct pl_render_params params = {
-        .upscaler = &pl_filter_nearest,
-        .downscaler = &pl_filter_nearest,
-    };
+    // Same reasoning as the display path: zeroed render params would leave HDR
+    // sources untone-mapped, so screenshots of them would come out clipped.
+    const struct pl_render_params params = pl_render_default_params;
 
     if (!ra_next_render_image(p->ra, &source_frame, &target_frame, &params)) {
         mp_msg(p->log, MSGL_ERR, "pl_video_screenshot: rendering failed\n");
