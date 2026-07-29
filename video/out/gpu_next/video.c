@@ -55,6 +55,14 @@ struct pl_video_osd_state {
     struct pl_overlay overlays[MAX_OSD_PARTS];      // The final overlays to be rendered.
 };
 
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+#define HWDEC_FENCE_CAP 8
+struct hwdec_fence {
+    GLsync sync;
+    struct mp_image *image;
+};
+#endif
+
 /**
  * @brief Main structure managing synchronous libplacebo video rendering.
  *
@@ -89,6 +97,10 @@ struct pl_video {
     struct ra_hwdec_ctx *hwdec_ctx;
     struct ra_hwdec_mapper *hwdec_mapper;
     struct ra_hwdec_mapper *el_hwdec_mapper;
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    struct hwdec_fence hwdec_fences[HWDEC_FENCE_CAP];
+    int num_hwdec_fences;
+#endif
 
 };
 
@@ -206,15 +218,58 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     return true;
 }
 
-static void hwdec_sync(pl_gpu gpu, struct frame_priv *fp)
+static void hwdec_sync(pl_gpu gpu, struct mp_image *mpi, struct frame_priv *fp)
 {
-    if (!fp->hwdec_synced) {
-        // The mapped textures ultimately reference VideoToolbox IOSurfaces.
-        // Do not release those references until libplacebo has finished
-        // sampling them, or the decoder may recycle a surface still in flight.
-        pl_gpu_finish(gpu);
-        fp->hwdec_synced = true;
+    if (fp->hwdec_synced)
+        return;
+
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    struct pl_video *p = fp->p;
+    struct ra *ra = p->hwdec_mapper->ra;
+    if (ra_is_gl(ra)) {
+        GL *gl = ra_gl_get(ra);
+        if (!gl->FenceSync || !gl->ClientWaitSync || !gl->DeleteSync)
+            goto finish;
+        while (p->num_hwdec_fences) {
+            struct hwdec_fence *oldest = &p->hwdec_fences[0];
+            bool wait = p->num_hwdec_fences == HWDEC_FENCE_CAP;
+            GLenum status = gl->ClientWaitSync(
+                oldest->sync, wait ? GL_SYNC_FLUSH_COMMANDS_BIT : 0,
+                wait ? GL_TIMEOUT_IGNORED : 0);
+            if (status != GL_ALREADY_SIGNALED &&
+                status != GL_CONDITION_SATISFIED)
+                break;
+            gl->DeleteSync(oldest->sync);
+            mp_image_unrefp(&oldest->image);
+            memmove(oldest, oldest + 1,
+                    --p->num_hwdec_fences * sizeof(*oldest));
+        }
+        if (p->num_hwdec_fences == HWDEC_FENCE_CAP) {
+            pl_gpu_finish(gpu);
+            for (int i = 0; i < p->num_hwdec_fences; i++) {
+                gl->DeleteSync(p->hwdec_fences[i].sync);
+                mp_image_unrefp(&p->hwdec_fences[i].image);
+            }
+            p->num_hwdec_fences = 0;
+        }
+
+        GLsync sync = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (sync) {
+            p->hwdec_fences[p->num_hwdec_fences++] = (struct hwdec_fence) {
+                .sync = sync,
+                .image = mp_image_new_ref(mpi),
+            };
+            gl->Flush();
+            fp->hwdec_synced = true;
+            return;
+        }
     }
+#endif
+
+finish:
+    // No asynchronous fence support: preserve correctness over throughput.
+    pl_gpu_finish(gpu);
+    fp->hwdec_synced = true;
 }
 
 static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
@@ -222,10 +277,7 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
-    // ponytail: only FEL needs a blocking barrier; single-layer playback must
-    // keep GPU work pipelined to sustain 4K50/60.
-    if (mpi->enhancement_layer)
-        hwdec_sync(gpu, fp);
+    hwdec_sync(gpu, mpi, fp);
     if (!ra_pl_get(p->hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
@@ -257,7 +309,7 @@ static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *bl = frame->user_data;
     struct frame_priv *fp = bl->priv;
     struct pl_video *p = fp->p;
-    hwdec_sync(gpu, fp);
+    hwdec_sync(gpu, bl, fp);
     if (!ra_pl_get(p->el_hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
@@ -456,6 +508,16 @@ void pl_video_uninit(struct pl_video **p_ptr) {
     if (!p) return;
 
     ra_next_queue_destroy(&p->queue);
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    if (p->num_hwdec_fences) {
+        pl_gpu_finish(p->ra->gpu);
+        GL *gl = ra_gl_get(p->hwdec_mapper->ra);
+        for (int i = 0; i < p->num_hwdec_fences; i++) {
+            gl->DeleteSync(p->hwdec_fences[i].sync);
+            mp_image_unrefp(&p->hwdec_fences[i].image);
+        }
+    }
+#endif
     ra_hwdec_mapper_free(&p->hwdec_mapper);
     ra_hwdec_mapper_free(&p->el_hwdec_mapper);
 

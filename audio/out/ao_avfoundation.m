@@ -25,7 +25,10 @@
 #include "osdep/timer.h"
 #include "ta/ta_talloc.h"
 
+#include <libavcodec/avcodec.h>
+
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <Foundation/Foundation.h>
 #import <CoreAudioTypes/CoreAudioTypes.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -74,11 +77,38 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
 // Build the 'ec-3' format description once the first real frame tells us the
 // sample rate and channel count. Deferred because ad_spdif reports the IEC
 // 61937 carrier (192 kHz stereo), not the actual audio.
-static bool compressed_make_format(struct ao *ao, const struct eac3_frame *fr)
+static int eac3_profile(const uint8_t *data, size_t size)
+{
+    int profile = AV_PROFILE_UNKNOWN;
+    AVCodecParserContext *parser = av_parser_init(AV_CODEC_ID_EAC3);
+    AVCodecContext *codec = avcodec_alloc_context3(NULL);
+    if (parser && codec) {
+        parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+        uint8_t *out = NULL;
+        int out_size = 0;
+        if (av_parser_parse2(parser, codec, &out, &out_size, data, size,
+                             AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0) > 0)
+            profile = codec->profile;
+    }
+    avcodec_free_context(&codec);
+    if (parser)
+        av_parser_close(parser);
+    return profile;
+}
+
+static bool compressed_make_format(struct ao *ao, const struct eac3_frame *fr,
+                                   const uint8_t *data, size_t size)
 {
     struct priv *p = ao->priv;
     if (p->format_description)
         return true;
+
+    bool atmos = eac3_profile(data, size) == AV_PROFILE_EAC3_DDP_ATMOS;
+    uint8_t cookie[EAC3_DEC3_COOKIE_MAX_BYTES];
+    size_t cookie_size = eac3_make_dec3_cookie(fr, size, atmos, cookie);
+    if (!cookie_size)
+        MP_WARN(ao, "E-AC-3 dependent substreams have no dec3 metadata; "
+                    "using the bitstream layout\n");
 
     AudioStreamBasicDescription asbd = {
         .mSampleRate       = fr->rate,
@@ -86,9 +116,46 @@ static bool compressed_make_format(struct ao *ao, const struct eac3_frame *fr)
         .mFramesPerPacket  = fr->samples,
         .mChannelsPerFrame = fr->channels,
     };
+    AudioChannelLayout layout = {0};
+    const AudioChannelLayout *layout_ptr = NULL;
+    size_t layout_size = 0;
 
-    OSStatus err = CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL,
-                                                  NULL, &p->format_description);
+    AudioFormatInfo info = {
+        .mASBD = asbd,
+        .mMagicCookie = cookie_size ? cookie : NULL,
+        .mMagicCookieSize = cookie_size,
+    };
+    UInt32 list_size = 0;
+    OSStatus err = AudioFormatGetPropertyInfo(kAudioFormatProperty_FormatList,
+                                               sizeof(info), &info, &list_size);
+    AudioFormatListItem *formats = err == noErr ? malloc(list_size) : NULL;
+    if (formats) {
+        err = AudioFormatGetProperty(kAudioFormatProperty_FormatList,
+                                     sizeof(info), &info, &list_size, formats);
+        UInt32 count = list_size / sizeof(*formats);
+        UInt32 selected = 0;
+        UInt32 selected_size = sizeof(selected);
+        if (err == noErr && count &&
+            AudioFormatGetProperty(kAudioFormatProperty_FirstPlayableFormatFromList,
+                                   list_size, formats, &selected_size,
+                                   &selected) == noErr &&
+            selected < count)
+        {
+            asbd = formats[selected].mASBD;
+            layout.mChannelLayoutTag = formats[selected].mChannelLayoutTag;
+            layout_ptr = &layout;
+            layout_size = offsetof(AudioChannelLayout, mChannelDescriptions);
+        }
+    }
+    free(formats);
+    if (!layout_ptr)
+        MP_WARN(ao, "CoreAudio could not derive the E-AC-3 format list; "
+                    "using the bitstream layout\n");
+
+    err = CMAudioFormatDescriptionCreate(NULL, &asbd, layout_size, layout_ptr,
+                                         cookie_size,
+                                         cookie_size ? cookie : NULL, NULL,
+                                         &p->format_description);
     if (err != noErr) {
         MP_FATAL(ao, "failed to create compressed audio format description\n");
         MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", (int)err);
@@ -96,8 +163,9 @@ static bool compressed_make_format(struct ao *ao, const struct eac3_frame *fr)
     }
 
     p->compressed_rate = fr->rate;
-    MP_VERBOSE(ao, "compressed passthrough: E-AC-3 %d Hz, %d channels\n",
-               fr->rate, fr->channels);
+    MP_VERBOSE(ao, "compressed passthrough: E-AC-3%s %d Hz, %d channels\n",
+               atmos ? "+JOC Atmos" : "", fr->rate,
+               asbd.mChannelsPerFrame);
     return true;
 }
 
@@ -154,8 +222,6 @@ done:
 static bool compressed_submit_burst(struct ao *ao, const uint8_t *payload,
                                     size_t payload_len)
 {
-    struct priv *p = ao->priv;
-
     // Recover the original elementary-stream byte order.
     uint8_t *raw = talloc_size(NULL, payload_len + 1);
     iec61937_unswap(raw, payload, payload_len);
@@ -181,7 +247,7 @@ static bool compressed_submit_burst(struct ao *ao, const uint8_t *payload,
         if (!samples)
             break;      // a dependent frame with no independent parent
 
-        if (!compressed_make_format(ao, &fr)) {
+        if (!compressed_make_format(ao, &fr, raw + pos, pkt)) {
             ok = false;
             break;
         }

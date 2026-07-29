@@ -32,6 +32,7 @@
 #define IEC61937_SYNC_B 0x4E1F
 #define IEC61937_DATA_TYPE_EAC3 21
 #define IEC61937_HEADER_BYTES 8
+#define EAC3_DEC3_COOKIE_MAX_BYTES 15
 
 // One E-AC-3 sync frame.
 struct eac3_frame {
@@ -39,6 +40,10 @@ struct eac3_frame {
     int samples;        // 0 for a dependent substream (no independent timing)
     int rate;
     int channels;
+    int fscod;
+    int bsid;
+    int acmod;
+    int lfeon;
     bool independent;
 };
 
@@ -79,8 +84,52 @@ static inline bool eac3_parse_frame(const uint8_t *buf, size_t len,
         .samples     = strmtyp != 1 ? blocks[numblks] * 256 : 0,
         .rate        = rates[fscod],
         .channels    = acmod_ch[acmod] + lfeon,
+        .fscod       = fscod,
+        .bsid        = (buf[5] >> 3) & 0x1F,
+        .acmod       = acmod,
+        .lfeon       = lfeon,
     };
     return true;
+}
+
+// Build the complete big-endian 'dec3' atom CoreAudio expects as the E-AC-3
+// magic cookie. The JOC extension changes FormatList's richest entry from
+// channel-based 'ec-3' to object-based 'ec+3'.
+static inline size_t eac3_make_dec3_cookie(const struct eac3_frame *fr,
+                                           size_t packet_size, bool atmos,
+                                           uint8_t cookie[EAC3_DEC3_COOKIE_MAX_BYTES])
+{
+    // ponytail: the common JOC form is one independent sync frame. Do not
+    // invent chan_loc metadata for dependent substreams without a real sample.
+    if (!fr->independent || fr->samples <= 0 || packet_size != (size_t)fr->size)
+        return 0;
+
+    int data_rate = (int)((packet_size * 8ULL * fr->rate +
+                           fr->samples * 500ULL) /
+                          (fr->samples * 1000ULL));
+    if (data_rate < 0 || data_rate > 0x1FFF)
+        return 0;
+
+    size_t size = atmos ? 15 : 13;
+    cookie[0] = cookie[1] = cookie[2] = 0;
+    cookie[3] = size;
+    cookie[4] = 'd';
+    cookie[5] = 'e';
+    cookie[6] = 'c';
+    cookie[7] = '3';
+    cookie[8] = data_rate >> 5;
+    cookie[9] = (data_rate & 0x1F) << 3; // num_ind_sub = 0
+
+    uint32_t substream = (fr->fscod << 22) | (fr->bsid << 17) |
+                         (fr->acmod << 9) | (fr->lfeon << 8);
+    cookie[10] = substream >> 16;
+    cookie[11] = substream >> 8;
+    cookie[12] = substream;
+    if (atmos) {
+        cookie[13] = 0x01; // flag_ec3_extension_type_a
+        cookie[14] = 0x10; // JOC complexity_index_type_a
+    }
+    return size;
 }
 
 // Locate the next IEC 61937 burst at or after *pos. On success sets *pos to

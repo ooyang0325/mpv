@@ -24,7 +24,31 @@ static void make_frame(uint8_t *buf, int size, int strmtyp, int fscod,
     buf[3] = frmsiz & 0xFF;
     buf[4] = ((fscod & 3) << 6) | ((numblkscod & 3) << 4) |
              ((acmod & 7) << 1) | (lfeon & 1);
-    buf[5] = 0x00;
+    buf[5] = 16 << 3;              // E-AC-3 bsid
+}
+
+static void test_dec3_cookie(void)
+{
+    uint8_t frame[FRAME_BYTES];
+    struct eac3_frame fr;
+    make_frame(frame, FRAME_BYTES, 0, 0, 3, 7, 1);
+    assert_true(eac3_parse_frame(frame, sizeof(frame), &fr));
+
+    uint8_t cookie[EAC3_DEC3_COOKIE_MAX_BYTES];
+    const uint8_t plain[] = {
+        0x00, 0x00, 0x00, 0x0d, 'd', 'e', 'c', '3',
+        0x18, 0x00, 0x20, 0x0f, 0x00,
+    };
+    const uint8_t atmos[] = {
+        0x00, 0x00, 0x00, 0x0f, 'd', 'e', 'c', '3',
+        0x18, 0x00, 0x20, 0x0f, 0x00, 0x01, 0x10,
+    };
+    size_t size = eac3_make_dec3_cookie(&fr, FRAME_BYTES, false, cookie);
+    assert_int_equal(size, sizeof(plain));
+    assert_true(memcmp(cookie, plain, size) == 0);
+    size = eac3_make_dec3_cookie(&fr, FRAME_BYTES, true, cookie);
+    assert_int_equal(size, sizeof(atmos));
+    assert_true(memcmp(cookie, atmos, size) == 0);
 }
 
 // Wrap a payload into an IEC 61937 burst exactly as the spdif muxer does:
@@ -156,5 +180,6 @@ int main(void)
     test_frame_parsing();
     test_burst_round_trip();
     test_burst_scanning();
+    test_dec3_cookie();
     return 0;
 }
