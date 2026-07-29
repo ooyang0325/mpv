@@ -80,6 +80,11 @@ struct pl_video {
 
     // Renderer options (--target-prim, --target-trc, --target-peak, ...).
     struct m_config_cache *opts_cache;
+
+    // Recycled plane textures, so uploading a frame does not also mean
+    // allocating and freeing its textures. Entries are groups of 4.
+    pl_tex **tex_pool;
+    int num_tex_pool;
 };
 
 /**
@@ -88,13 +93,30 @@ struct pl_video {
  */
 struct frame_priv {
     struct pl_video *p; // A pointer back to the main pl_video engine struct.
+    pl_tex *tex;        // Base-layer plane textures, returned to the pool on unmap.
 #if PL_API_VER >= 367
     // Dolby Vision profile 7 enhancement layer, paired onto the base layer by
     // the filter chain. Only valid while `has_el` is set.
     struct pl_frame el_frame;
+    pl_tex *el_tex;
     bool has_el;
 #endif
 };
+
+// Take a group of 4 plane textures from the pool, or allocate a fresh (zeroed)
+// group if the pool is empty.
+static pl_tex *tex_group_get(struct pl_video *p)
+{
+    if (p->num_tex_pool > 0)
+        return p->tex_pool[--p->num_tex_pool];
+    return talloc_zero_array(p, pl_tex, 4);
+}
+
+static void tex_group_put(struct pl_video *p, pl_tex *group)
+{
+    if (group)
+        MP_TARRAY_APPEND(p, p->tex_pool, p->num_tex_pool, group);
+}
 
 /**
  * @brief Callback to map an mp_image to a pl_frame for rendering.
@@ -114,9 +136,11 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
 
-    // Use the RA helper to upload the mp_image data to a new set of textures
-    // and populate the pl_frame struct with the result.
-    if (!ra_upload_mp_image(p->ra, frame, mpi)) {
+    // Upload into recycled textures rather than allocating a new set per frame.
+    fp->tex = tex_group_get(p);
+    if (!upload_mp_image_reuse(p->ra, frame, mpi, fp->tex)) {
+        tex_group_put(p, fp->tex);
+        fp->tex = NULL;
         talloc_free(mpi); // Clean up the mp_image reference on failure
         return false;
     }
@@ -134,7 +158,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     if (mpi->enhancement_layer) {
         struct mp_image *el = mpi->enhancement_layer;
 
-        if (ra_upload_mp_image(p->ra, &fp->el_frame, el)) {
+        fp->el_tex = tex_group_get(p);
+        if (upload_mp_image_reuse(p->ra, &fp->el_frame, el, fp->el_tex)) {
             pl_frame_set_chroma_location(&fp->el_frame,
                                          el->params.chroma_location);
             fp->el_frame.user_data = mpi;
@@ -143,6 +168,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         } else {
             // The base layer on its own is still a valid picture, so fall back
             // to it rather than dropping the frame.
+            tex_group_put(p, fp->el_tex);
+            fp->el_tex = NULL;
             mp_msg(p->log, MSGL_WARN, "Failed uploading Dolby Vision "
                    "enhancement layer; rendering base layer only.\n");
         }
@@ -172,16 +199,18 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     struct pl_video *p = fp->p;
 
 #if PL_API_VER >= 367
-    // The enhancement layer owns its own textures, and is not reachable from
+    // The enhancement layer keeps its own textures, and is not reachable from
     // `frame` once the renderer is done with it.
     if (fp->has_el) {
-        ra_cleanup_pl_frame(p->ra, &fp->el_frame);
+        tex_group_put(p, fp->el_tex);
+        fp->el_tex = NULL;
         fp->has_el = false;
     }
 #endif
 
-    // Use the RA helper to destroy the GPU textures associated with the frame.
-    ra_cleanup_pl_frame(p->ra, frame);
+    // Hand the textures back for the next frame instead of destroying them.
+    tex_group_put(p, fp->tex);
+    fp->tex = NULL;
     // Free the mp_image reference itself.
     talloc_free(mpi);
 }
@@ -244,6 +273,15 @@ void pl_video_uninit(struct pl_video **p_ptr) {
         ra_next_tex_destroy(p->ra, &p->sub_tex[i]);
     }
     talloc_free(p->sub_tex);
+
+    // The recycled plane textures outlive individual frames, so they are only
+    // released here. The queue is destroyed above, which returns any still-held
+    // groups to the pool first.
+    for (int i = 0; i < p->num_tex_pool; i++) {
+        for (int n = 0; n < 4; n++)
+            ra_next_tex_destroy(p->ra, &p->tex_pool[i][n]);
+    }
+    talloc_free(p->tex_pool);
 
     talloc_free(p);
     *p_ptr = NULL;

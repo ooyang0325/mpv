@@ -11,6 +11,9 @@
 #include "libplacebo/log.h"                // for pl_log
 #include "libplacebo/utils/frame_queue.h"  // for pl_queue_create, pl_queue_...
 #include "ta/ta_talloc.h"                  // for talloc_free, talloc_zero
+#include "osdep/threads.h"                 // for mp_mutex
+#include "video/mp_image.h"                // for mp_image_from_buffer
+#include "video/out/vo.h"                  // for VO_DR_FLAG_HOST_CACHED
 #include "video/img_format.h"              // for mp_imgfmt_comp_desc, mp_im...
 #include "video/mp_image.h"                // for mp_image, mp_image_params
 #include "video/out/vo.h"                  // for vo
@@ -32,6 +35,12 @@ struct ra_priv {
     int num_sub_tex;        // Current number of textures in the pool.
     pl_tex overlay_tex;     // A texture for overlays.
     pl_log pl_log;          // The libplacebo logging context.
+
+    // Direct-rendering buffers handed to the decoder. Touched from the decoder
+    // threads as well as the render thread, hence the lock.
+    mp_mutex dr_lock;
+    pl_buf *dr_buffers;
+    int num_dr_buffers;
 };
 
 /* --- New Abstraction Implementations --- */
@@ -292,8 +301,91 @@ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
  * @param img The input `mp_image`.
  * @return True on success, false on failure.
  */
+// Direct-rendering buffers handed out via ra_next_dr_alloc(). Frames decoded
+// into one of these are already in GPU-visible memory, so uploading them is a
+// device-side copy instead of a full trip through the CPU.
+static pl_buf dr_lookup(struct ra_next *ra, const uint8_t *ptr)
+{
+    struct ra_priv *p = (struct ra_priv *) ra;
+    mp_mutex_lock(&p->dr_lock);
+    for (int i = 0; i < p->num_dr_buffers; i++) {
+        pl_buf buf = p->dr_buffers[i];
+        if (ptr >= buf->data && ptr < buf->data + buf->params.size) {
+            mp_mutex_unlock(&p->dr_lock);
+            return buf;
+        }
+    }
+    mp_mutex_unlock(&p->dr_lock);
+    return NULL;
+}
+
+static void dr_free(void *opaque, uint8_t *data)
+{
+    struct ra_next *ra = opaque;
+    struct ra_priv *p = (struct ra_priv *) ra;
+    mp_mutex_lock(&p->dr_lock);
+    for (int i = 0; i < p->num_dr_buffers; i++) {
+        if (p->dr_buffers[i]->data == data) {
+            pl_buf_destroy(ra->gpu, &p->dr_buffers[i]);
+            MP_TARRAY_REMOVE_AT(p->dr_buffers, p->num_dr_buffers, i);
+            mp_mutex_unlock(&p->dr_lock);
+            return;
+        }
+    }
+    mp_mutex_unlock(&p->dr_lock);
+}
+
+struct mp_image *ra_next_dr_alloc(struct ra_next *ra, int imgfmt, int w, int h,
+                                  int stride_align, int flags)
+{
+    struct ra_priv *p = (struct ra_priv *) ra;
+    pl_gpu gpu = ra->gpu;
+    if (!gpu || !gpu->limits.thread_safe || !gpu->limits.max_mapped_size)
+        return NULL;
+    if ((flags & VO_DR_FLAG_HOST_CACHED) && !gpu->limits.host_cached)
+        return NULL;
+
+    stride_align = mp_lcm(stride_align, gpu->limits.align_tex_xfer_pitch);
+    stride_align = mp_lcm(stride_align, gpu->limits.align_tex_xfer_offset);
+    int size = mp_image_get_alloc_size(imgfmt, w, h, stride_align);
+    if (size < 0)
+        return NULL;
+
+    pl_buf buf = pl_buf_create(gpu, &(struct pl_buf_params) {
+        .memory_type = PL_BUF_MEM_HOST,
+        .host_mapped = true,
+        .size = size + stride_align,
+    });
+    if (!buf)
+        return NULL;
+
+    struct mp_image *mpi = mp_image_from_buffer(imgfmt, w, h, stride_align,
+                                                buf->data, buf->params.size,
+                                                ra, dr_free);
+    if (!mpi) {
+        pl_buf_destroy(gpu, &buf);
+        return NULL;
+    }
+
+    mp_mutex_lock(&p->dr_lock);
+    MP_TARRAY_APPEND(p, p->dr_buffers, p->num_dr_buffers, buf);
+    mp_mutex_unlock(&p->dr_lock);
+    return mpi;
+}
+
 bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame,
                                         const struct mp_image *img)
+{
+    return upload_mp_image_reuse(ra, out_frame, img, NULL);
+}
+
+// Uploading a 4K frame means moving ~25 MB to the GPU. Allocating and
+// destroying the destination textures for every single frame on top of that is
+// pure overhead, so callers can hand in the textures from the previous frame:
+// pl_upload_plane reuses them when the format and size still match, and only
+// reallocates when they don't.
+bool upload_mp_image_reuse(struct ra_next *ra, struct pl_frame *out_frame,
+                           const struct mp_image *img, pl_tex *reuse)
 {
     // Initialize the frame with color space and crop metadata.
     *out_frame = (struct pl_frame){
@@ -323,7 +415,19 @@ bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame,
         data[n].row_stride = img->stride[n];
         data[n].pixels = img->planes[n];
 
-        // Let libplacebo handle the texture creation and data upload.
+        // Decoded straight into GPU-visible memory: hand libplacebo the buffer
+        // rather than the host pointer, so no CPU copy is needed.
+        pl_buf dr = dr_lookup(ra, data[n].pixels);
+        if (dr) {
+            data[n].buf = dr;
+            data[n].buf_offset = (uint8_t *) data[n].pixels - dr->data;
+            data[n].pixels = NULL;
+        }
+
+        // Let libplacebo handle the texture creation and data upload, reusing
+        // the caller's texture when one was supplied.
+        if (reuse)
+            out_frame->planes[n].texture = reuse[n];
         if (!pl_upload_plane(ra->gpu, &out_frame->planes[n],
                              &out_frame->planes[n].texture, &data[n]))
         {
@@ -332,11 +436,18 @@ bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame,
         }
     }
 
+    if (reuse) {
+        for (int n = 0; n < planes; n++)
+            reuse[n] = out_frame->planes[n].texture;
+    }
+
     return true;
 
 error:
     // Clean up any successfully created textures if one fails.
     ra_pl_cleanup_frame(ra, out_frame);
+    if (reuse)
+        memset(reuse, 0, sizeof(pl_tex) * 4);
     return false;
 }
 
@@ -372,6 +483,11 @@ void ra_pl_destroy(struct ra_next **rap)
         pl_renderer_destroy(&p->renderer);
     }
 
+    // Any direct-rendering buffers should have been released with their frames.
+    for (int i = 0; i < p->num_dr_buffers; i++)
+        pl_buf_destroy(p->pub.gpu, &p->dr_buffers[i]);
+    mp_mutex_destroy(&p->dr_lock);
+
     // Finally free the ra_priv block itself
     mp_msg(p->pub.log, MSGL_DEBUG, "ra_pl_destroy: freeing ra_priv %p\n", (void*)p);
     talloc_free(p);
@@ -397,6 +513,7 @@ struct ra_next *ra_pl_create(pl_gpu gpu, struct mp_log *log, pl_log log_pl)
     ra->gpu = gpu;
     ra->log = mp_log_new(p, log, "ra-pl"); // Create a sub-logger for this module.
     p->pl_log = log_pl;
+    mp_mutex_init(&p->dr_lock);
 
     // Create renderer (needed by the higher-level pl_render_image calls)
     p->renderer = pl_renderer_create(log_pl, gpu);

@@ -283,7 +283,10 @@ static int set_parameter(struct render_backend *ctx, mpv_render_param param)
 static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
                                   int w, int h, int stride_align, int flags)
 {
-    return NULL;
+    struct priv *p = ctx->priv;
+    if (!p->context || !p->context->ra)
+        return NULL;
+    return ra_next_dr_alloc(p->context->ra, imgfmt, w, h, stride_align, flags);
 }
 
 /*

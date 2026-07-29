@@ -83,6 +83,19 @@ void ra_pl_reset(struct ra_next *ra);
  * This is exposed for use in pl_video_screenshot. */
 bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame, const struct mp_image *img);
 
+/* As above, but reuses (and updates) the caller's textures instead of creating
+ * a fresh set for every frame. `reuse` must point to 4 entries, zeroed before
+ * first use. The caller owns them and must destroy them when done. */
+bool upload_mp_image_reuse(struct ra_next *ra, struct pl_frame *out_frame,
+                           const struct mp_image *img, pl_tex *reuse);
+
+/* Allocate an mp_image backed by GPU-visible memory, so the decoder can write
+ * directly into something the GPU can read without a further copy. Returns NULL
+ * if the GPU cannot support it, in which case the caller should fall back to
+ * ordinary allocation. */
+struct mp_image *ra_next_dr_alloc(struct ra_next *ra, int imgfmt, int w, int h,
+                                  int stride_align, int flags);
+
 /* Internal helper: cleanup a pl_frame (used by ra_cleanup_pl_frame).
  * This is exposed for use in pl_video_screenshot. */
 void ra_pl_cleanup_frame(struct ra_next *ra, struct pl_frame *frame);
