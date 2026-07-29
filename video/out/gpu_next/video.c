@@ -83,6 +83,12 @@ struct pl_video {
  */
 struct frame_priv {
     struct pl_video *p; // A pointer back to the main pl_video engine struct.
+#if PL_API_VER >= 367
+    // Dolby Vision profile 7 enhancement layer, paired onto the base layer by
+    // the filter chain. Only valid while `has_el` is set.
+    struct pl_frame el_frame;
+    bool has_el;
+#endif
 };
 
 /**
@@ -110,9 +116,33 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         return false;
     }
 
-    // Subsampled chroma planes are not co-sited with luma, so libplacebo has
-    // to be told where they sit, or chroma is sampled off-grid.
+    // Subsampled chroma planes are not co-sited with luma, so libplacebo has to
+    // be told where they sit. This also has to agree between the base layer and
+    // the enhancement layer below, or the two would be sampled against
+    // different grids and would not line up.
     pl_frame_set_chroma_location(frame, mpi->params.chroma_location);
+
+#if PL_API_VER >= 367
+    // Dolby Vision profile 7 carries a second video track whose residual is
+    // composed onto the base layer. The filter chain pairs the two, so it
+    // arrives here as a child image; libplacebo does the actual compositing.
+    if (mpi->enhancement_layer) {
+        struct mp_image *el = mpi->enhancement_layer;
+
+        if (ra_upload_mp_image(p->ra, &fp->el_frame, el)) {
+            pl_frame_set_chroma_location(&fp->el_frame,
+                                         el->params.chroma_location);
+            fp->el_frame.user_data = mpi;
+            fp->has_el = true;
+            frame->enhancement_layer = &fp->el_frame;
+        } else {
+            // The base layer on its own is still a valid picture, so fall back
+            // to it rather than dropping the frame.
+            mp_msg(p->log, MSGL_WARN, "Failed uploading Dolby Vision "
+                   "enhancement layer; rendering base layer only.\n");
+        }
+    }
+#endif
 
     // Store a pointer back to the original mp_image. This is used to get a unique
     // signature for the frame and to access metadata (like colorspace) later.
@@ -135,6 +165,15 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
+
+#if PL_API_VER >= 367
+    // The enhancement layer owns its own textures, and is not reachable from
+    // `frame` once the renderer is done with it.
+    if (fp->has_el) {
+        ra_cleanup_pl_frame(p->ra, &fp->el_frame);
+        fp->has_el = false;
+    }
+#endif
 
     // Use the RA helper to destroy the GPU textures associated with the frame.
     ra_cleanup_pl_frame(p->ra, frame);
