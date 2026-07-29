@@ -29,9 +29,11 @@ class View: NSView, CALayerDelegate {
     override var acceptsFirstResponder: Bool { return true }
 
     override var isOpaque: Bool {
+#if HAVE_VULKAN
         if let metalLayer = layer as? MetalLayer {
             return !metalLayer.isOpaque
         }
+#endif
 
         return true
     }
