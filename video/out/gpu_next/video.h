@@ -26,7 +26,8 @@ void pl_video_uninit(struct pl_video **p_ptr);
 /**
  * Synchronously renders a video frame to a display target using libplacebo.
  */
-void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex);
+void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex,
+                     bool flip);
 
 /**
  * Synchronously renders `frame` into an sRGB temporary and returns a newly

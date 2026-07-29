@@ -360,8 +360,12 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
  * @param p The pl_video engine context.
  * @param frame The mpv frame to render, containing the current image.
  * @param target_tex The destination GPU texture to render to.
+ * @param flip Whether to render the target vertically flipped. API users
+ *             rendering into an OpenGL FBO ask for this, because GL's origin
+ *             is bottom-left while mpv works top-left.
  */
-void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex)
+void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex,
+                     bool flip)
 {
     // Describe the target surface for libplacebo.
     struct pl_frame target_frame = {
@@ -371,6 +375,13 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
         .color = pl_color_space_srgb,
         .repr = pl_color_repr_rgb,
     };
+
+    // libplacebo expresses a vertical flip as an inverted crop rectangle.
+    if (flip) {
+        float y0 = target_frame.crop.y0;
+        target_frame.crop.y0 = target_frame.crop.y1;
+        target_frame.crop.y1 = y0;
+    }
 
     // The libmpv VO provides one new frame at a time in frame->current.
     // We check the frame_id to avoid pushing duplicates.

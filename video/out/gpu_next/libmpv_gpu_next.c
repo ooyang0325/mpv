@@ -135,8 +135,14 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     if (err < 0) return err;
     if (!target_tex) return MPV_ERROR_GENERIC;
 
+    // API users rendering into an OpenGL FBO ask for a vertical flip, because
+    // GL's origin is bottom-left while mpv works top-left. Ignoring this drew
+    // every frame upside down.
+    bool flip = *(int *)get_mpv_render_param(params, MPV_RENDER_PARAM_FLIP_Y,
+                                             &(int){0});
+
     // Render the video frame.
-    pl_video_render(p->video_engine, frame, target_tex);
+    pl_video_render(p->video_engine, frame, target_tex, flip);
 
     // Destroy the temporary wrapper texture via the RA.
     ra_next_tex_destroy(p->context->ra, &target_tex);
