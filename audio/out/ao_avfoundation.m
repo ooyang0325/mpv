@@ -80,19 +80,22 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
 static int eac3_profile(const uint8_t *data, size_t size)
 {
     int profile = AV_PROFILE_UNKNOWN;
-    AVCodecParserContext *parser = av_parser_init(AV_CODEC_ID_EAC3);
-    AVCodecContext *codec = avcodec_alloc_context3(NULL);
-    if (parser && codec) {
-        parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
-        uint8_t *out = NULL;
-        int out_size = 0;
-        if (av_parser_parse2(parser, codec, &out, &out_size, data, size,
-                             AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0) > 0)
+    const AVCodec *decoder = avcodec_find_decoder(AV_CODEC_ID_EAC3);
+    AVCodecContext *codec = avcodec_alloc_context3(decoder);
+    AVPacket *packet = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    if (codec && packet && frame && av_new_packet(packet, size) >= 0) {
+        memcpy(packet->data, data, size);
+        // The public parser does not expose the JOC flag. Decode only this
+        // first frame to inspect its profile; playback remains compressed.
+        if (avcodec_open2(codec, decoder, NULL) >= 0 &&
+            avcodec_send_packet(codec, packet) >= 0 &&
+            avcodec_receive_frame(codec, frame) >= 0)
             profile = codec->profile;
     }
+    av_frame_free(&frame);
+    av_packet_free(&packet);
     avcodec_free_context(&codec);
-    if (parser)
-        av_parser_close(parser);
     return profile;
 }
 
