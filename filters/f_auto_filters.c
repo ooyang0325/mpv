@@ -23,6 +23,7 @@ struct deint_priv {
     struct mp_subfilter sub;
     int prev_imgfmt;
     bool interlaced_frame;
+    bool warned_enhancement_layer;
     struct m_config_cache *opts;
 };
 
@@ -62,6 +63,14 @@ static void deint_process(struct mp_filter *f)
     // We check also if a filter is already present, to avoid removing it
     bool filter_needed = opts->deinterlace == 1 ||
                          (opts->deinterlace == -1 && (p->interlaced_frame || p->sub.filter));
+    if (filter_needed && img->enhancement_layer) {
+        if (!p->warned_enhancement_layer) {
+            MP_WARN(f, "Ignoring deinterlace: it cannot preserve a paired "
+                       "Dolby Vision enhancement layer.\n");
+            p->warned_enhancement_layer = true;
+        }
+        filter_needed = false;
+    }
 
     // If the image format changed, destroy any existing filter immediately since
     // it may not support the new format. If we no longer need a filter, drain
