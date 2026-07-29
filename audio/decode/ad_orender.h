@@ -25,6 +25,7 @@ struct ad_orender_params {
     char *library_path;         // explicit liborender path (else search order)
     char *config_path;          // override render config YAML (else shared default)
     char *bridge_path;          // override render.bridge_path
+    char *speaker_layout_path;  // override the renderer speaker layout YAML
     bool osc;                   // force OSC on (else follows config render.osc)
     int osc_port;               // outgoing/monitoring port (0 = config/default)
     int osc_rx_port;            // incoming control port  (0 = config/default 9000)

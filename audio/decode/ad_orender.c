@@ -60,6 +60,7 @@ const struct m_sub_options ad_orender_conf = {
         {"library", OPT_STRING(library_path), .flags = M_OPT_FILE},
         {"config", OPT_STRING(config_path), .flags = M_OPT_FILE},
         {"bridge-path", OPT_STRING(bridge_path), .flags = M_OPT_FILE},
+        {"speaker-layout", OPT_STRING(speaker_layout_path), .flags = M_OPT_FILE},
         {"osc", OPT_BOOL(osc)},
         {"osc-port", OPT_INT(osc_port), M_RANGE(0, 65535)},
         {"osc-rx-port", OPT_INT(osc_rx_port), M_RANGE(0, 65535)},
@@ -149,8 +150,7 @@ struct priv {
 };
 
 /* Map a liborender label (OrenderChannelLabel from the vendored ABI header) to
- * an mpv speaker id. The 7.1.4 default maps exactly. mpv's chmap has no
- * top-side L/R, so those degrade to NA (Phase 5: custom order). */
+ * an mpv speaker id. The built-in 7.1.4 and 9.1.6 layouts map exactly. */
 static int label_to_mp_speaker(uint8_t lbl)
 {
     switch (lbl) {
@@ -170,11 +170,13 @@ static int label_to_mp_speaker(uint8_t lbl)
     case OrenderChannelLabel_Lfe2: return MP_SPEAKER_ID_LFE2;
     case OrenderChannelLabel_Tfl:  return MP_SPEAKER_ID_TFL;
     case OrenderChannelLabel_Tfr:  return MP_SPEAKER_ID_TFR;
+    case OrenderChannelLabel_Tsl:  return MP_SPEAKER_ID_TSL;
+    case OrenderChannelLabel_Tsr:  return MP_SPEAKER_ID_TSR;
     case OrenderChannelLabel_Tfc:  return MP_SPEAKER_ID_TFC;
     case OrenderChannelLabel_Tbl:  return MP_SPEAKER_ID_TBL;
     case OrenderChannelLabel_Tbr:  return MP_SPEAKER_ID_TBR;
     case OrenderChannelLabel_Tc:   return MP_SPEAKER_ID_TC;
-    default:      return MP_SPEAKER_ID_NA;  /* incl. Tsl/Tsr/Lsd/Rsd */
+    default:      return MP_SPEAKER_ID_NA;  /* incl. Lsd/Rsd */
     }
 }
 
@@ -788,7 +790,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
          * on, otherwise osc_enabled=0 lets liborender follow render.osc. Ports/
          * host/bind 0/NULL fall back to the config then the built-in defaults. */
         .config_yaml_path    = nz(opts->config_path),
-        .speaker_layout_path = NULL,
+        .speaker_layout_path = nz(opts->speaker_layout_path),
         .bridge_path         = nz(opts->bridge_path),
         /* Tell the bridge which codec the raw access units carry: its raw
          * transport has no data-type byte to distinguish the supported
@@ -831,7 +833,9 @@ static struct mp_decoder *create(struct mp_filter *parent,
         const char *mapping = opts->output_channel_mapping_idx == 1
                             ? "by_index" : "by_name";
         if (p->dl->set_option(p->renderer, "output_channel_mapping", mapping) < 0)
-            MP_WARN(da, "could not set output channel mapping to %s\n", mapping);
+            MP_VERBOSE(da, "renderer does not support setting output channel "
+                           "mapping at runtime; applying %s to the host map\n",
+                       mapping);
     }
 
     if (p->renderer)
