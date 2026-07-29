@@ -99,6 +99,7 @@ struct pl_video {
 struct frame_priv {
     struct pl_video *p; // A pointer back to the main pl_video engine struct.
     struct ra_hwdec *hwdec;
+    bool hwdec_synced;
 #if PL_API_VER >= 367
     // Dolby Vision profile 7 enhancement layer, paired onto the base layer by
     // the filter chain. Only valid while `has_el` is set.
@@ -192,6 +193,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
+    fp->hwdec_synced = false;
     if (!hwdec_reconfig(p, &p->hwdec_mapper, fp->hwdec, &mpi->params) ||
         ra_hwdec_mapper_map(p->hwdec_mapper, mpi) < 0)
         return false;
@@ -204,10 +206,23 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     return true;
 }
 
+static void hwdec_sync(pl_gpu gpu, struct frame_priv *fp)
+{
+    if (!fp->hwdec_synced) {
+        // The mapped textures ultimately reference VideoToolbox IOSurfaces.
+        // Do not release those references until libplacebo has finished
+        // sampling them, or the decoder may recycle a surface still in flight.
+        pl_gpu_finish(gpu);
+        fp->hwdec_synced = true;
+    }
+}
+
 static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *mpi = frame->user_data;
-    struct pl_video *p = ((struct frame_priv *) mpi->priv)->p;
+    struct frame_priv *fp = mpi->priv;
+    struct pl_video *p = fp->p;
+    hwdec_sync(gpu, fp);
     if (!ra_pl_get(p->hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
@@ -237,7 +252,9 @@ static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
 static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *bl = frame->user_data;
-    struct pl_video *p = ((struct frame_priv *) bl->priv)->p;
+    struct frame_priv *fp = bl->priv;
+    struct pl_video *p = fp->p;
+    hwdec_sync(gpu, fp);
     if (!ra_pl_get(p->el_hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
