@@ -26,6 +26,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 // IEC 61937 burst preamble, as written by libavformat's spdif muxer.
 #define IEC61937_SYNC_A 0xF872
@@ -33,6 +34,7 @@
 #define IEC61937_DATA_TYPE_EAC3 21
 #define IEC61937_HEADER_BYTES 8
 #define EAC3_DEC3_COOKIE_MAX_BYTES 15
+#define EAC3_ISO_SAMPLE_ENTRY_MAX_BYTES 51
 
 // One E-AC-3 sync frame.
 struct eac3_frame {
@@ -129,6 +131,45 @@ static inline size_t eac3_make_dec3_cookie(const struct eac3_frame *fr,
         cookie[13] = 0x01; // flag_ec3_extension_type_a
         cookie[14] = 0x10; // JOC complexity_index_type_a
     }
+    return size;
+}
+
+static inline void eac3_write_be16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = value >> 8;
+    dst[1] = value;
+}
+
+static inline void eac3_write_be32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = value >> 24;
+    dst[1] = value >> 16;
+    dst[2] = value >> 8;
+    dst[3] = value;
+}
+
+// Build the ISO 'ec-3' AudioSampleEntry used by AVFoundation assets. Feeding
+// this through CoreMedia's native bridge preserves the container-level JOC
+// signaling that a bare CMAudioFormatDescription does not carry.
+static inline size_t eac3_make_iso_sample_entry(
+    const struct eac3_frame *fr, const uint8_t *cookie, size_t cookie_size,
+    uint8_t entry[EAC3_ISO_SAMPLE_ENTRY_MAX_BYTES])
+{
+    if ((cookie_size != 13 && cookie_size != 15) ||
+        cookie[3] != cookie_size || memcmp(cookie + 4, "dec3", 4) != 0 ||
+        fr->channels <= 0 || fr->channels > UINT16_MAX ||
+        fr->rate <= 0 || fr->rate > UINT16_MAX)
+        return 0;
+
+    size_t size = 36 + cookie_size;
+    memset(entry, 0, size);
+    eac3_write_be32(entry, size);
+    memcpy(entry + 4, "ec-3", 4);
+    eac3_write_be16(entry + 14, 1); // data_reference_index
+    eac3_write_be16(entry + 24, fr->channels);
+    eac3_write_be16(entry + 26, 16); // sample size
+    eac3_write_be32(entry + 32, (uint32_t)fr->rate << 16);
+    memcpy(entry + 36, cookie, cookie_size);
     return size;
 }
 

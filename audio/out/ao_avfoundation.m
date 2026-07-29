@@ -33,6 +33,7 @@
 #import <CoreAudioTypes/CoreAudioTypes.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreMedia/CMFormatDescriptionBridge.h>
 
 #include "ao_avfoundation_eac3.h"
 
@@ -113,52 +114,24 @@ static bool compressed_make_format(struct ao *ao, const struct eac3_frame *fr,
         MP_WARN(ao, "E-AC-3 dependent substreams have no dec3 metadata; "
                     "using the bitstream layout\n");
 
-    AudioStreamBasicDescription asbd = {
-        .mSampleRate       = fr->rate,
-        .mFormatID         = kAudioFormatEnhancedAC3,
-        .mFramesPerPacket  = fr->samples,
-        .mChannelsPerFrame = fr->channels,
-    };
-    AudioChannelLayout layout = {0};
-    const AudioChannelLayout *layout_ptr = NULL;
-    size_t layout_size = 0;
-
-    AudioFormatInfo info = {
-        .mASBD = asbd,
-        .mMagicCookie = cookie_size ? cookie : NULL,
-        .mMagicCookieSize = cookie_size,
-    };
-    UInt32 list_size = 0;
-    OSStatus err = AudioFormatGetPropertyInfo(kAudioFormatProperty_FormatList,
-                                               sizeof(info), &info, &list_size);
-    AudioFormatListItem *formats = err == noErr ? malloc(list_size) : NULL;
-    if (formats) {
-        err = AudioFormatGetProperty(kAudioFormatProperty_FormatList,
-                                     sizeof(info), &info, &list_size, formats);
-        UInt32 count = list_size / sizeof(*formats);
-        UInt32 selected = 0;
-        UInt32 selected_size = sizeof(selected);
-        if (err == noErr && count &&
-            AudioFormatGetProperty(kAudioFormatProperty_FirstPlayableFormatFromList,
-                                   list_size, formats, &selected_size,
-                                   &selected) == noErr &&
-            selected < count)
-        {
-            asbd = formats[selected].mASBD;
-            layout.mChannelLayoutTag = formats[selected].mChannelLayoutTag;
-            layout_ptr = &layout;
-            layout_size = offsetof(AudioChannelLayout, mChannelDescriptions);
-        }
+    uint8_t sample_entry[EAC3_ISO_SAMPLE_ENTRY_MAX_BYTES];
+    size_t entry_size = cookie_size
+        ? eac3_make_iso_sample_entry(fr, cookie, cookie_size, sample_entry) : 0;
+    OSStatus err;
+    if (entry_size) {
+        err = CMAudioFormatDescriptionCreateFromBigEndianSoundDescriptionData(
+            NULL, sample_entry, entry_size, kCMSoundDescriptionFlavor_ISOFamily,
+            &p->format_description);
+    } else {
+        AudioStreamBasicDescription asbd = {
+            .mSampleRate       = fr->rate,
+            .mFormatID         = kAudioFormatEnhancedAC3,
+            .mFramesPerPacket  = fr->samples,
+            .mChannelsPerFrame = fr->channels,
+        };
+        err = CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL,
+                                             NULL, &p->format_description);
     }
-    free(formats);
-    if (!layout_ptr)
-        MP_WARN(ao, "CoreAudio could not derive the E-AC-3 format list; "
-                    "using the bitstream layout\n");
-
-    err = CMAudioFormatDescriptionCreate(NULL, &asbd, layout_size, layout_ptr,
-                                         cookie_size,
-                                         cookie_size ? cookie : NULL, NULL,
-                                         &p->format_description);
     if (err != noErr) {
         MP_FATAL(ao, "failed to create compressed audio format description\n");
         MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", (int)err);
@@ -167,8 +140,7 @@ static bool compressed_make_format(struct ao *ao, const struct eac3_frame *fr,
 
     p->compressed_rate = fr->rate;
     MP_VERBOSE(ao, "compressed passthrough: E-AC-3%s %d Hz, %d channels\n",
-               atmos ? "+JOC Atmos" : "", fr->rate,
-               asbd.mChannelsPerFrame);
+               atmos ? "+JOC Atmos" : "", fr->rate, fr->channels);
     return true;
 }
 

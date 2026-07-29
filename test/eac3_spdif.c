@@ -49,6 +49,20 @@ static void test_dec3_cookie(void)
     size = eac3_make_dec3_cookie(&fr, FRAME_BYTES, true, cookie);
     assert_int_equal(size, sizeof(atmos));
     assert_true(memcmp(cookie, atmos, size) == 0);
+
+    const uint8_t sample_entry[] = {
+        0x00, 0x00, 0x00, 0x33, 'e', 'c', '-', '3',
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x06, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+        0xbb, 0x80, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x0f, 'd', 'e', 'c', '3',
+        0x18, 0x00, 0x20, 0x0f, 0x00, 0x01, 0x10,
+    };
+    uint8_t entry[EAC3_ISO_SAMPLE_ENTRY_MAX_BYTES];
+    size = eac3_make_iso_sample_entry(&fr, cookie, size, entry);
+    assert_int_equal(size, sizeof(sample_entry));
+    assert_true(memcmp(entry, sample_entry, size) == 0);
 }
 
 // Wrap a payload into an IEC 61937 burst exactly as the spdif muxer does:
