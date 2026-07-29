@@ -102,7 +102,17 @@ class Application: NSApplication, NSApplicationDelegate {
         NSApp.delegate = self
         NSApp.setActivationPolicy(appHub.isBundle ? .regular : .accessory)
         setupBundle()
-        pthread_create(&playbackThreadId, nil, playbackThread, TypeHelper.bridge(obj: self))
+        // Match the 8 MB stack the main thread (and glibc's threads) get.
+        // The default 512 KB is not enough for decoders with large stack
+        // frames; see MP_THREAD_STACK_SIZE in osdep/threads-posix.h.
+        var attr = pthread_attr_t()
+        if pthread_attr_init(&attr) == 0 {
+            pthread_attr_setstacksize(&attr, 8 * 1024 * 1024)
+            pthread_create(&playbackThreadId, &attr, playbackThread, TypeHelper.bridge(obj: self))
+            pthread_attr_destroy(&attr)
+        } else {
+            pthread_create(&playbackThreadId, nil, playbackThread, TypeHelper.bridge(obj: self))
+        }
         appHub.input.wait()
         NSApp.run()
 

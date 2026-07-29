@@ -99,6 +99,12 @@ test('linked-list', linked_list)
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 
+thread_stack = executable('thread-stack', files('thread_stack.c'),
+                          include_directories: incdir,
+                          dependencies: test_utils_deps, link_with: test_utils)
+test('thread-stack', thread_stack)
+
+
 format = executable('format', files('format.c'), include_directories: incdir, link_with: test_utils)
 test('format', format)
 

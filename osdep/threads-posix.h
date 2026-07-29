@@ -208,7 +208,37 @@ static inline int mp_cond_timedwait_until(mp_cond *cond, mp_mutex *mutex, int64_
 #define MP_THREAD_VOID void *
 #define MP_THREAD_RETURN() return NULL
 
+#if defined(__APPLE__)
+/* Apple gives secondary threads a 512 KB stack, where glibc and Windows give
+ * 8 MB. mpv's core thread runs the whole player (and, through libmpv, the
+ * host application's playback thread), so a decoder or a dlopen'd library
+ * with a large stack frame overflows it on macOS alone -- the same code runs
+ * fine everywhere else. Give our threads the same 8 MB the main thread gets,
+ * so stack depth behaves consistently across platforms.
+ *
+ * This only reserves address space; pages are committed on first touch. */
+#define MP_THREAD_STACK_SIZE (8 * 1024 * 1024)
+
+static inline int mp_thread_create_attr(pthread_t *thread,
+                                        void *(*fn)(void *), void *arg)
+{
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0)
+        return pthread_create(thread, NULL, fn, arg);
+    /* Fall back to the default stack if the size is rejected. */
+    if (pthread_attr_setstacksize(&attr, MP_THREAD_STACK_SIZE) != 0) {
+        pthread_attr_destroy(&attr);
+        return pthread_create(thread, NULL, fn, arg);
+    }
+    int res = pthread_create(thread, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return res;
+}
+
+#define mp_thread_create(t, f, a) mp_thread_create_attr(t, f, a)
+#else
 #define mp_thread_create(t, f, a) pthread_create(t, NULL, f, a)
+#endif
 #define mp_thread_join(t)         pthread_join(t, NULL)
 #define mp_thread_detach          pthread_detach
 #define mp_thread_current_id      pthread_self
