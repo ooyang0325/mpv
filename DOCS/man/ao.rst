@@ -153,6 +153,18 @@ Available audio output drivers are:
     in AVFoundation, which supports `spatial audio
     <https://support.apple.com/en-us/HT211775>`_.
 
+    Combined with ``--audio-spdif=eac3`` this passes Dolby Digital Plus
+    through to AVFoundation undecoded, instead of sending it to a receiver
+    over S/PDIF or HDMI. AVFoundation then decodes it itself, including the
+    JOC extension that carries Dolby Atmos objects, and spatializes the
+    result — so object audio survives to Apple's spatial renderer and gets
+    head tracking on AirPods. Decoding it locally cannot do this, because
+    FFmpeg discards the objects and yields only the 5.1/7.1 bed.
+
+    Only E-AC-3 is passed through this way. AC-3 and DTS carry no objects,
+    so there is nothing to gain over decoding them normally, and CoreAudio
+    cannot decode TrueHD at all.
+
     .. warning::
 
         Turning on spatial audio may hang the playback

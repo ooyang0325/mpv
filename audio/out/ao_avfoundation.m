@@ -31,6 +31,8 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 
+#include "ao_avfoundation_eac3.h"
+
 
 @interface AVObserver : NSObject {
     struct ao *ao;
@@ -45,6 +47,17 @@ struct priv {
     CMAudioFormatDescriptionRef format_description;
     AVObserver *observer;
     int64_t end_time_av;
+
+    // Compressed (E-AC-3) passthrough state. When set, ao_read_data() hands us
+    // an IEC 61937 byte stream from ad_spdif, which we unwrap back into raw
+    // elementary frames for AVSampleBufferAudioRenderer to decode itself.
+    bool compressed;
+    uint8_t *burst;             // accumulates across feed() calls
+    size_t burst_len;
+    int compressed_rate;        // real sample rate, not the 192 kHz carrier
+    int64_t compressed_pts;     // in compressed_rate units
+    int64_t compressed_packets; // enqueued so far, for diagnostics
+    bool compressed_failed;     // renderer.error already reported
 };
 
 static int64_t CMTimeGetNanoseconds(CMTime time)
@@ -58,9 +71,216 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
     return CMTimeMake(time, 1000000000);
 }
 
+// Build the 'ec-3' format description once the first real frame tells us the
+// sample rate and channel count. Deferred because ad_spdif reports the IEC
+// 61937 carrier (192 kHz stereo), not the actual audio.
+static bool compressed_make_format(struct ao *ao, const struct eac3_frame *fr)
+{
+    struct priv *p = ao->priv;
+    if (p->format_description)
+        return true;
+
+    AudioStreamBasicDescription asbd = {
+        .mSampleRate       = fr->rate,
+        .mFormatID         = kAudioFormatEnhancedAC3,
+        .mFramesPerPacket  = fr->samples,
+        .mChannelsPerFrame = fr->channels,
+    };
+
+    OSStatus err = CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL,
+                                                  NULL, &p->format_description);
+    if (err != noErr) {
+        MP_FATAL(ao, "failed to create compressed audio format description\n");
+        MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", (int)err);
+        return false;
+    }
+
+    p->compressed_rate = fr->rate;
+    MP_VERBOSE(ao, "compressed passthrough: E-AC-3 %d Hz, %d channels\n",
+               fr->rate, fr->channels);
+    return true;
+}
+
+// Hand one packet (an independent frame plus any dependent substreams that
+// follow it) to the renderer.
+static bool compressed_enqueue(struct ao *ao, const uint8_t *data, size_t size,
+                               int samples)
+{
+    struct priv *p = ao->priv;
+    CMBlockBufferRef bb = NULL;
+    CMSampleBufferRef sb = NULL;
+    bool ok = false;
+    OSStatus err;
+
+    if ((err = CMBlockBufferCreateWithMemoryBlock(NULL, NULL, size, kCFAllocatorDefault,
+                                                  NULL, 0, size, 0, &bb)) != noErr)
+    {
+        MP_ERR(ao, "failed to create block buffer (%d)\n", (int)err);
+        goto done;
+    }
+    if ((err = CMBlockBufferReplaceDataBytes(data, bb, 0, size)) != noErr) {
+        MP_ERR(ao, "failed to fill block buffer (%d)\n", (int)err);
+        goto done;
+    }
+
+    CMSampleTimingInfo timing = {
+        .duration              = CMTimeMake(samples, p->compressed_rate),
+        .presentationTimeStamp = CMTimeMake(p->compressed_pts, p->compressed_rate),
+        .decodeTimeStamp       = kCMTimeInvalid,
+    };
+    size_t sample_size = size;
+    if ((err = CMSampleBufferCreateReady(NULL, bb, p->format_description, 1, 1,
+                                         &timing, 1, &sample_size, &sb)) != noErr)
+    {
+        MP_ERR(ao, "failed to create compressed sample buffer (%d)\n", (int)err);
+        goto done;
+    }
+
+    [p->renderer enqueueSampleBuffer:sb];
+    p->compressed_pts += samples;
+    if (!p->compressed_packets)
+        MP_VERBOSE(ao, "compressed passthrough: first packet enqueued\n");
+    p->compressed_packets++;
+    ok = true;
+
+done:
+    if (bb) CFRelease(bb);
+    if (sb) CFRelease(sb);
+    return ok;
+}
+
+// Unwrap one IEC 61937 burst payload (16-bit byte swapped) and enqueue the
+// elementary frames inside it. Returns false on a fatal error.
+static bool compressed_submit_burst(struct ao *ao, const uint8_t *payload,
+                                    size_t payload_len)
+{
+    struct priv *p = ao->priv;
+
+    // Recover the original elementary-stream byte order.
+    uint8_t *raw = talloc_size(NULL, payload_len + 1);
+    iec61937_unswap(raw, payload, payload_len);
+
+    bool ok = true;
+    size_t pos = 0;
+    while (pos < payload_len) {
+        struct eac3_frame fr;
+        if (!eac3_parse_frame(raw + pos, payload_len - pos, &fr))
+            break;      // trailing padding, or a frame we do not understand
+
+        // Gather any dependent substreams into the same packet.
+        size_t pkt = fr.size;
+        int samples = fr.samples;
+        struct eac3_frame next;
+        while (pos + pkt < payload_len &&
+               eac3_parse_frame(raw + pos + pkt, payload_len - pos - pkt, &next) &&
+               !next.independent)
+        {
+            pkt += next.size;
+        }
+
+        if (!samples)
+            break;      // a dependent frame with no independent parent
+
+        if (!compressed_make_format(ao, &fr)) {
+            ok = false;
+            break;
+        }
+        if (!compressed_enqueue(ao, raw + pos, pkt, samples)) {
+            ok = false;
+            break;
+        }
+        pos += pkt;
+    }
+
+    talloc_free(raw);
+    return ok;
+}
+
+// Pull from the audio chain and forward compressed frames to the renderer.
+static void feed_compressed(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+
+    int request_sample_count = ao->samplerate / 10;
+    int buffer_size = request_sample_count * ao->sstride;
+    void *chunk = talloc_size(NULL, buffer_size);
+    void *data[] = {chunk};
+
+    int64_t cur_time_av = CMTimeGetNanoseconds([p->synchronizer currentTime]);
+    int64_t cur_time_mp = mp_time_ns();
+    int64_t end_time_av = MPMAX(p->end_time_av, cur_time_av);
+    int64_t time_delta = CMTimeGetNanoseconds(CMTimeMake(request_sample_count,
+                                                         ao->samplerate));
+    bool eof;
+    int got = ao_read_data(ao, data, request_sample_count,
+                           end_time_av - cur_time_av + cur_time_mp + time_delta,
+                           &eof, false, true);
+    if (eof) {
+        [p->renderer stopRequestingMediaData];
+        ao_stop_streaming(ao);
+    }
+    if (got <= 0)
+        goto done;
+
+    // Burst boundaries do not line up with the chunks the audio chain hands
+    // out, so carry a partial burst over to the next call.
+    size_t add = (size_t)got * ao->sstride;
+    p->burst = talloc_realloc_size(ao, p->burst, p->burst_len + add);
+    memcpy(p->burst + p->burst_len, chunk, add);
+    p->burst_len += add;
+
+    size_t pos = 0;
+    int data_type, pd;
+    while (iec61937_find_burst(p->burst, p->burst_len, &pos, &data_type, &pd)) {
+        // Pd is a byte count for E-AC-3 (it is a bit count for some other
+        // data types, which we never see here).
+        if (data_type != IEC61937_DATA_TYPE_EAC3) {
+            pos += 2;
+            continue;
+        }
+        if (p->burst_len - pos - IEC61937_HEADER_BYTES < (size_t)pd)
+            break;      // wait for the rest of the payload
+
+        if (!compressed_submit_burst(ao, p->burst + pos + IEC61937_HEADER_BYTES, pd)) {
+            ao_request_reload(ao);
+            goto done;
+        }
+        pos += IEC61937_HEADER_BYTES + pd;
+    }
+
+    if (pos) {
+        memmove(p->burst, p->burst + pos, p->burst_len - pos);
+        p->burst_len -= pos;
+    }
+
+    // A rejected compressed stream fails here rather than at init, and the
+    // renderer just stops consuming -- which is silent. Say so loudly.
+    if (p->renderer.error && !p->compressed_failed) {
+        p->compressed_failed = true;
+        MP_FATAL(ao, "AVFoundation rejected the compressed stream: %s\n",
+                 p->renderer.error.localizedDescription.UTF8String);
+        // ponytail: no automatic fallback to PCM -- mpv only re-negotiates
+        // passthrough at init. Re-run without --audio-spdif to decode locally.
+        MP_FATAL(ao, "retry without --audio-spdif to decode locally instead\n");
+    }
+
+    // Account for wall-clock pacing in carrier-rate terms, as the PCM path does.
+    p->end_time_av = end_time_av +
+                     CMTimeGetNanoseconds(CMTimeMake(got, ao->samplerate));
+
+done:
+    talloc_free(chunk);
+}
+
 static void feed(struct ao *ao)
 {
     struct priv *p = ao->priv;
+
+    if (p->compressed) {
+        feed_compressed(ao);
+        return;
+    }
+
     int samplerate = ao->samplerate;
     int sstride = ao->sstride;
 
@@ -261,11 +481,40 @@ static int init(struct ao *ao)
 #endif
 
     if (af_fmt_is_spdif(ao->format)) {
-        MP_FATAL(ao, "avfoundation does not support SPDIF\n");
+        // Hand the compressed stream to AVFoundation instead of decoding it.
+        // Apple's renderer decodes E-AC-3 including its JOC extension, so the
+        // Atmos objects survive to its spatializer -- FFmpeg would have thrown
+        // them away and left us with the 5.1 bed.
+        //
+        // ponytail: E-AC-3 only. AC-3 and DTS carry no objects (nothing to
+        // gain over normal decoding), and CoreAudio cannot decode TrueHD at
+        // all, so there is no format ID to ask for.
+        if (ao->format != AF_FORMAT_S_EAC3) {
+            MP_FATAL(ao, "avfoundation passthrough supports E-AC-3 only\n");
 #if HAVE_COREAUDIO
-        MP_FATAL(ao, "please use coreaudio_exclusive instead\n");
+            MP_FATAL(ao, "please use coreaudio_exclusive instead\n");
 #endif
-        goto error;
+            goto error;
+        }
+        p->compressed = true;
+    }
+
+#if HAVE_MACOS_12_FEATURES
+    if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *)) {
+        // Let the renderer spatialize whatever it decodes. The default already
+        // allows multichannel; asking for mono/stereo too means a downmixed or
+        // 2-channel presentation still gets spatialized rather than played flat.
+        [p->renderer setAllowedAudioSpatializationFormats:
+            AVAudioSpatializationFormatMonoStereoAndMultichannel];
+    }
+#endif
+
+    if (p->compressed) {
+        // The format description needs the real rate and channel count, which
+        // only the first frame reveals; feed_compressed() builds it then.
+        // AVSampleBufferAudioRenderer read ahead aggressively
+        ao->device_buffer = ao->samplerate * 2;
+        goto skip_pcm_format;
     }
 
     // AVSampleBufferAudioRenderer only supports interleaved formats
@@ -301,6 +550,7 @@ static int init(struct ao *ao)
     // AVSampleBufferAudioRenderer read ahead aggressively
     ao->device_buffer = ao->samplerate * 2;
 
+skip_pcm_format:
     p->observer = [[AVObserver alloc] initWithAO:ao];
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
 #if HAVE_MACOS_12_FEATURES

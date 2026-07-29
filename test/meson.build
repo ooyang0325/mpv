@@ -104,6 +104,11 @@ thread_stack = executable('thread-stack', files('thread_stack.c'),
                           dependencies: test_utils_deps, link_with: test_utils)
 test('thread-stack', thread_stack)
 
+if darwin
+    eac3_spdif = executable('eac3-spdif', files('eac3_spdif.c'),
+                            include_directories: incdir, link_with: test_utils)
+    test('eac3-spdif', eac3_spdif)
+endif
 
 format = executable('format', files('format.c'), include_directories: incdir, link_with: test_utils)
 test('format', format)
