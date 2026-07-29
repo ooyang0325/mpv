@@ -435,6 +435,14 @@ void mp_output_chain_set_el_stream(struct mp_output_chain *c,
         }
     }
 
+    for (int n = 0; n < p->num_pre_filters; n++) {
+        struct mp_user_filter *u = p->pre_filters[n];
+        if (strcmp(u->name, "userdeint") == 0) {
+            mp_deint_set_disabled(u->f, p->el_pair);
+            break;
+        }
+    }
+
     relink_filter_list(p);
 }
 

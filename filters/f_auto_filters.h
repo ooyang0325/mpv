@@ -16,3 +16,4 @@ struct mp_filter *mp_autorotate_create(struct mp_filter *parent);
 struct mp_filter *mp_autoaspeed_create(struct mp_filter *parent);
 
 bool mp_deint_active(struct mp_filter *parent);
+void mp_deint_set_disabled(struct mp_filter *parent, bool disabled);

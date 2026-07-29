@@ -23,7 +23,7 @@ struct deint_priv {
     struct mp_subfilter sub;
     int prev_imgfmt;
     bool interlaced_frame;
-    bool warned_enhancement_layer;
+    bool disabled;
     struct m_config_cache *opts;
 };
 
@@ -50,6 +50,12 @@ static void deint_process(struct mp_filter *f)
     struct mp_image *img = frame.data;
     p->interlaced_frame = img->fields & MP_IMGFIELD_INTERLACED;
 
+    if (p->disabled) {
+        mp_subfilter_destroy(&p->sub);
+        mp_subfilter_continue(&p->sub);
+        return;
+    }
+
     m_config_cache_update(p->opts);
     struct filter_opts *opts = p->opts->opts;
 
@@ -63,14 +69,6 @@ static void deint_process(struct mp_filter *f)
     // We check also if a filter is already present, to avoid removing it
     bool filter_needed = opts->deinterlace == 1 ||
                          (opts->deinterlace == -1 && (p->interlaced_frame || p->sub.filter));
-    if (filter_needed && img->enhancement_layer) {
-        if (!p->warned_enhancement_layer) {
-            MP_WARN(f, "Ignoring deinterlace: it cannot preserve a paired "
-                       "Dolby Vision enhancement layer.\n");
-            p->warned_enhancement_layer = true;
-        }
-        filter_needed = false;
-    }
 
     // If the image format changed, destroy any existing filter immediately since
     // it may not support the new format. If we no longer need a filter, drain
@@ -213,7 +211,20 @@ bool mp_deint_active(struct mp_filter *f)
 {
     struct deint_priv *p = f->priv;
     struct filter_opts *opts = p->opts->opts;
-    return opts->deinterlace == 1 || (opts->deinterlace == -1 && p->interlaced_frame);
+    return !p->disabled &&
+           (opts->deinterlace == 1 ||
+            (opts->deinterlace == -1 && p->interlaced_frame));
+}
+
+void mp_deint_set_disabled(struct mp_filter *f, bool disabled)
+{
+    struct deint_priv *p = f->priv;
+    if (disabled && !p->disabled) {
+        MP_WARN(f, "Ignoring deinterlace: it cannot preserve a paired "
+                   "Dolby Vision enhancement layer.\n");
+    }
+    p->disabled = disabled;
+    mp_filter_wakeup(f);
 }
 
 struct mp_filter *mp_deint_create(struct mp_filter *parent)
