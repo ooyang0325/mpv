@@ -702,6 +702,16 @@ if features['libarchive']
                      'stream/stream_libarchive.c')
 endif
 
+# liborender is loaded at runtime (dlopen) against the vendored ABI header
+# common/orender_abi.h — no build-time library or pkg-config dependency. See
+# common/orender_dl.c for the search order and the version handshake.
+features += {'orender': get_option('orender').allowed()}
+if features['orender']
+    sources += files('audio/decode/ad_orender.c',
+                     'common/orender_dl.c',
+                     'player/orender_overlay.c')
+endif
+
 libavdevice = dependency('libavdevice', version: '>= 60.3.100', required: get_option('libavdevice'))
 features += {'libavdevice': libavdevice.found()}
 if features['libavdevice']
@@ -960,6 +970,14 @@ if features['wasapi']
     sources += files('audio/out/ao_wasapi.c',
                      'audio/out/ao_wasapi_changenotify.c',
                      'audio/out/ao_wasapi_utils.c')
+endif
+
+asio = cc.has_header('objbase.h', required:
+    get_option('asio').require(win32))
+features += {'asio': asio}
+if features['asio']
+    sources += files('audio/out/ao_asio.c')
+    dependencies += cc.find_library('advapi32', required: false)
 endif
 
 

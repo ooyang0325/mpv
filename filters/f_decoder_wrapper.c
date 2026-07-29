@@ -26,6 +26,7 @@
 #include <libavutil/common.h>
 #include <libavutil/rational.h>
 
+#include "config.h"
 #include "options/options.h"
 #include "common/msg.h"
 #include "options/m_config.h"
@@ -418,6 +419,26 @@ struct mp_decoder_list *audio_decoder_list(void)
     return list;
 }
 
+#if HAVE_ORENDER
+// True if `tok` appears as a whole entry in a "," separated decoder list.
+static bool decoder_list_has(const char *list, const char *tok)
+{
+    if (!list)
+        return false;
+    size_t tlen = strlen(tok);
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == tlen && strncmp(p, tok, tlen) == 0)
+            return true;
+        if (!e)
+            break;
+        p = e + 1;
+    }
+    return false;
+}
+#endif
+
 static bool reinit_decoder(struct priv *p)
 {
     if (p->decoder)
@@ -455,6 +476,33 @@ static bool reinit_decoder(struct priv *p)
                 talloc_free(spdif);
             }
         }
+
+#if HAVE_ORENDER
+        // Opt-in spatial object rendering for the supported codecs via
+        // `--ad=orender`. Unlike ad_spdif this outputs normal float PCM
+        // (AF_FORMAT_FLOAT), so the native resampler / audio filter chain still
+        // applies. Gated on the explicit decoder name so default playback is
+        // unaffected. ad_orender stays selected for the whole track and decodes
+        // host-mode content via an internal native child, so the wrapper never
+        // needs to swap it back out.
+        if (driver == &ad_lavc && p->codec->codec &&
+            (strcmp(p->codec->codec, "truehd") == 0 ||
+             strcmp(p->codec->codec, "eac3") == 0 ||
+             strcmp(p->codec->codec, "ac3") == 0 ||
+             strcmp(p->codec->codec, "dts") == 0) &&
+            decoder_list_has(user_list, "orender"))
+        {
+            struct mp_decoder_list *ol =
+                talloc_zero(NULL, struct mp_decoder_list);
+            ad_orender.add_decoders(ol);
+            if (ol->num_entries) {
+                driver = &ad_orender;
+                list = ol;
+            } else {
+                talloc_free(ol);
+            }
+        }
+#endif
     }
 
     if (!driver)
@@ -1065,8 +1113,9 @@ static void read_frame(struct priv *p)
     p->reverse_queue_complete = false;
 
     frame = mp_pin_out_read(p->decoder->f->pins[1]);
-    if (!frame.type)
+    if (!frame.type) {
         return;
+    }
 
     mp_mutex_lock(&p->cache_lock);
     if (p->attached_picture && frame.type == MP_FRAME_VIDEO)

@@ -661,6 +661,9 @@ bool mp_load_scripts(struct MPContext *mpctx);
 void mp_load_builtin_scripts(struct MPContext *mpctx);
 int64_t mp_load_user_script(struct MPContext *mpctx, const char *fname);
 
+// orender_overlay.c (built only with the orender feature)
+void mp_orender_overlay_start(struct MPContext *mpctx);
+
 // sub.c
 void redraw_subs(struct MPContext *mpctx);
 void reset_subtitle_state(struct MPContext *mpctx);

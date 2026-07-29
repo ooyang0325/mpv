@@ -440,6 +440,10 @@ int mp_initialize(struct MPContext *mpctx, char **options)
 
     mp_load_scripts(mpctx);
 
+#if HAVE_ORENDER
+    mp_orender_overlay_start(mpctx);
+#endif
+
     if (opts->force_vo == 2 && handle_force_window(mpctx, false) < 0)
         return -1;
 

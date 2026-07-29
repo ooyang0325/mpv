@@ -18,6 +18,7 @@ option('jpeg', type: 'feature', value: 'auto', description: 'libjpeg image write
 option('lcms2', type: 'feature', value: 'auto', description: 'LCMS2 support')
 option('libarchive', type: 'feature', value: 'auto', description: 'libarchive wrapper for reading zip files and more')
 option('libavdevice', type: 'feature', value: 'auto', description: 'libavdevice')
+option('orender', type: 'feature', value: 'auto', description: 'Spatial audio decoder via the orender (liborender) library, loaded at runtime (dlopen); no build-time dependency')
 option('libbluray', type: 'feature', value: 'auto', description: 'Bluray support')
 option('libcurl', type: 'feature', value: 'auto', description: 'libcurl-based stream backend')
 option('lua',
@@ -56,6 +57,7 @@ option('pulse', type: 'feature', value: 'auto', description: 'PulseAudio audio o
 option('sdl2-audio', type: 'feature', value: 'disabled', description: 'SDL2 audio output')
 option('sndio', type: 'feature', value: 'auto', description: 'sndio audio output')
 option('wasapi', type: 'feature', value: 'auto', description: 'WASAPI audio output')
+option('asio', type: 'feature', value: 'auto', description: 'Steinberg ASIO audio output (Windows)')
 
 # video output features
 option('amf', type: 'feature', value: 'auto', description: 'AMD AMF')

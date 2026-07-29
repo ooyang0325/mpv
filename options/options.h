@@ -388,6 +388,9 @@ typedef struct MPOpts {
 
     struct vd_lavc_params *vd_lavc_params;
     struct ad_lavc_params *ad_lavc_params;
+    // Always present (incomplete type when orender is disabled); only the
+    // ad-orender sub-option registration in options.c is HAVE_ORENDER-gated.
+    struct ad_orender_params *ad_orender_params;
 
     struct hwdec_opts *hwdec_opts;
 

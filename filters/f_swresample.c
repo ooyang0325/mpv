@@ -217,7 +217,18 @@ static bool configure_lavrr(struct priv *p, bool verbose)
         mp_aframe_set_chmap(p->pool_fmt, &map_out);
 
     AVChannelLayout in_layout, out_layout;
-    mp_chmap_to_av_layout_custom(&in_layout, &map_in);
+    // orender: keep by-index (positionless) output byte-for-byte. The guard
+    // earlier reduces map_in/map_out to "unknown" whenever either side is
+    // positionless (or in == out), which makes in_lavc == out_lavc here.
+    // Upstream then hands libswresample an UNSPEC in_chlayout, and some builds
+    // (notably the ffmpeg-dovi used for the DV FEL player) reorder the channels
+    // when going UNSPEC -> positional out_lavc. Pass the positional in_lavc for
+    // unknown maps so swr sees in == out and does a strict 1:1 copy, never a
+    // channel permutation. The genuinely-positional path is left untouched.
+    if (mp_chmap_is_unknown(&map_in))
+        mp_chmap_to_av_layout(&in_layout, &in_lavc);
+    else
+        mp_chmap_to_av_layout_custom(&in_layout, &map_in);
     mp_chmap_to_av_layout(&out_layout, &out_lavc);
     av_opt_set_chlayout(p->avrctx, "in_chlayout",  &in_layout, 0);
     av_opt_set_chlayout(p->avrctx, "out_chlayout", &out_layout, 0);
