@@ -379,6 +379,16 @@ static void stop(struct ao *ao)
         [p->renderer stopRequestingMediaData];
         [p->renderer flush];
         [p->synchronizer setRate:0];
+        if (p->compressed) {
+            talloc_free(p->burst);
+            p->burst = NULL;
+            p->burst_len = 0;
+            CMTime now = [p->synchronizer currentTime];
+            p->compressed_pts = p->compressed_rate > 0 && CMTIME_IS_NUMERIC(now)
+                              ? CMTimeConvertScale(now, p->compressed_rate,
+                                                   kCMTimeRoundingMethod_Default).value
+                              : 0;
+        }
     });
 }
 

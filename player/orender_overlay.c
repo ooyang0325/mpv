@@ -378,7 +378,8 @@ void mp_orender_overlay_start(struct MPContext *mpctx)
     ctx->log = mp_client_get_log(client);
     ctx->client = client;
     ctx->dl = dl;
-    ctx->enabled = true;
+    ctx->enabled = false;
+    ctx->dl->overlay_set_enabled(false);
     ctx->cap = INITIAL_CAP;
     ctx->buf = malloc(ctx->cap + 1);
     ctx->heatmap_buf = malloc(HEATMAP_PIX_CAP);

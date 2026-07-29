@@ -222,7 +222,10 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
-    hwdec_sync(gpu, fp);
+    // ponytail: only FEL needs a blocking barrier; single-layer playback must
+    // keep GPU work pipelined to sustain 4K50/60.
+    if (mpi->enhancement_layer)
+        hwdec_sync(gpu, fp);
     if (!ra_pl_get(p->hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
