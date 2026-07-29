@@ -5,6 +5,7 @@
 
 // Forward declarations
 struct mp_image_params;
+struct ra_hwdec_ctx;
 struct mp_log;
 struct mp_osd_res;
 struct mp_rect;
@@ -22,6 +23,7 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
  * Shuts down and destroys the rendering engine.
  */
 void pl_video_uninit(struct pl_video **p_ptr);
+void pl_video_set_hwdec(struct pl_video *p, struct ra_hwdec_ctx *hwdec);
 
 /**
  * Synchronously renders a video frame to a display target using libplacebo.

@@ -9,6 +9,10 @@
 #include "libplacebo/filters.h"            // for pl_filter_nearest
 #include "libplacebo/gpu.h"                // for pl_tex_params, pl_tex_t
 #include "libplacebo/renderer.h"           // for pl_frame_mix, pl_frame
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+#include <libplacebo/opengl.h>
+#include "video/out/opengl/ra_gl.h"
+#endif
 #include "sub/draw_bmp.h"                  // for mp_draw_sub_formats
 #include "sub/osd.h"                       // for sub_bitmap, sub_bitmaps
 #include "ta/ta_talloc.h"                  // for talloc_free, talloc_zero
@@ -17,6 +21,8 @@
 #include "video/mp_image.h"                // for mp_image, mp_image_params
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
 #include "video/out/gpu/video.h"          // for gl_video_conf, gl_video_opts
+#include "video/out/gpu/hwdec.h"
+#include "video/out/placebo/ra_pl.h"
 #include "options/m_config.h"             // for m_config_cache
 #include "video/out/vo.h"                  // for vo_frame
 
@@ -80,11 +86,10 @@ struct pl_video {
 
     // Renderer options (--target-prim, --target-trc, --target-peak, ...).
     struct m_config_cache *opts_cache;
+    struct ra_hwdec_ctx *hwdec_ctx;
+    struct ra_hwdec_mapper *hwdec_mapper;
+    struct ra_hwdec_mapper *el_hwdec_mapper;
 
-    // Recycled plane textures, so uploading a frame does not also mean
-    // allocating and freeing its textures. Entries are groups of 4.
-    pl_tex **tex_pool;
-    int num_tex_pool;
 };
 
 /**
@@ -93,30 +98,153 @@ struct pl_video {
  */
 struct frame_priv {
     struct pl_video *p; // A pointer back to the main pl_video engine struct.
-    pl_tex *tex;        // Base-layer plane textures, returned to the pool on unmap.
+    struct ra_hwdec *hwdec;
 #if PL_API_VER >= 367
     // Dolby Vision profile 7 enhancement layer, paired onto the base layer by
     // the filter chain. Only valid while `has_el` is set.
     struct pl_frame el_frame;
-    pl_tex *el_tex;
+    struct ra_hwdec *el_hwdec;
     bool has_el;
 #endif
 };
 
-// Take a group of 4 plane textures from the pool, or allocate a fresh (zeroed)
-// group if the pool is empty.
-static pl_tex *tex_group_get(struct pl_video *p)
+void pl_video_set_hwdec(struct pl_video *p, struct ra_hwdec_ctx *hwdec)
 {
-    if (p->num_tex_pool > 0)
-        return p->tex_pool[--p->num_tex_pool];
-    return talloc_zero_array(p, pl_tex, 4);
+    p->hwdec_ctx = hwdec;
 }
 
-static void tex_group_put(struct pl_video *p, pl_tex *group)
+static bool hwdec_reconfig(struct pl_video *p,
+                           struct ra_hwdec_mapper **mapper,
+                           struct ra_hwdec *hwdec,
+                           const struct mp_image_params *par)
 {
-    if (group)
-        MP_TARRAY_APPEND(p, p->tex_pool, p->num_tex_pool, group);
+    if (*mapper) {
+        if (mp_image_params_static_equal(par, &(*mapper)->src_params)) {
+            // Dynamic Dolby Vision and HDR metadata changes per frame.
+            (*mapper)->src_params.repr.dovi = par->repr.dovi;
+            (*mapper)->dst_params.repr.dovi = par->repr.dovi;
+            (*mapper)->src_params.color.hdr = par->color.hdr;
+            (*mapper)->dst_params.color.hdr = par->color.hdr;
+            return true;
+        }
+        ra_hwdec_mapper_free(mapper);
+    }
+
+    *mapper = ra_hwdec_mapper_create(hwdec, par);
+    if (!*mapper) {
+        mp_msg(p->log, MSGL_ERR,
+               "Initializing texture for hardware decoding failed.\n");
+        return false;
+    }
+    return true;
 }
+
+// The hwdec mapper returns old-RA textures. Wrap their raw OpenGL names into
+// temporary libplacebo textures so the renderer can sample them directly.
+static pl_tex hwdec_get_tex(struct pl_video *p,
+                            struct ra_hwdec_mapper *mapper, int n)
+{
+    struct ra_tex *ratex = mapper->tex[n];
+    struct ra *ra = mapper->ra;
+    if (ra_pl_get(ra))
+        return (pl_tex) ratex->priv;
+
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    if (ra_is_gl(ra) && pl_opengl_get(p->ra->gpu)) {
+        struct pl_opengl_wrap_params par = {
+            .width = ratex->params.w,
+            .height = ratex->params.h,
+        };
+        ra_gl_get_format(ratex->params.format, &par.iformat,
+                         &(GLenum){0}, &(GLenum){0});
+        ra_gl_get_raw_tex(ra, ratex, &par.texture, &par.target);
+        return pl_opengl_wrap(p->ra->gpu, &par);
+    }
+#endif
+
+    mp_msg(p->log, MSGL_ERR, "Cannot wrap hardware-decoder texture.\n");
+    return NULL;
+}
+
+static void setup_hwdec_plane_mapping(struct pl_frame *frame,
+                                      const struct mp_imgfmt_desc *desc)
+{
+    frame->num_planes = desc->num_planes;
+    for (int n = 0; n < frame->num_planes; n++) {
+        struct pl_plane *plane = &frame->planes[n];
+        int *map = plane->component_mapping;
+        for (int c = 0; c < mp_imgfmt_desc_get_num_comps(desc); c++) {
+            if (desc->comps[c].plane != n)
+                continue;
+            uint8_t offset = desc->comps[c].offset;
+            int index = plane->components++;
+            while (index > 0 && desc->comps[map[index - 1]].offset > offset) {
+                map[index] = map[index - 1];
+                index--;
+            }
+            map[index] = c;
+        }
+    }
+}
+
+static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct frame_priv *fp = mpi->priv;
+    struct pl_video *p = fp->p;
+    if (!hwdec_reconfig(p, &p->hwdec_mapper, fp->hwdec, &mpi->params) ||
+        ra_hwdec_mapper_map(p->hwdec_mapper, mpi) < 0)
+        return false;
+
+    for (int n = 0; n < frame->num_planes; n++) {
+        frame->planes[n].texture = hwdec_get_tex(p, p->hwdec_mapper, n);
+        if (!frame->planes[n].texture)
+            return false;
+    }
+    return true;
+}
+
+static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct pl_video *p = ((struct frame_priv *) mpi->priv)->p;
+    if (!ra_pl_get(p->hwdec_mapper->ra)) {
+        for (int n = 0; n < frame->num_planes; n++)
+            pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
+    }
+    ra_hwdec_mapper_unmap(p->hwdec_mapper);
+}
+
+#if PL_API_VER >= 367
+static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *bl = frame->user_data;
+    struct mp_image *el = bl->enhancement_layer;
+    struct frame_priv *fp = bl->priv;
+    struct pl_video *p = fp->p;
+    if (!hwdec_reconfig(p, &p->el_hwdec_mapper, fp->el_hwdec, &el->params) ||
+        ra_hwdec_mapper_map(p->el_hwdec_mapper, el) < 0)
+        return false;
+
+    for (int n = 0; n < frame->num_planes; n++) {
+        frame->planes[n].texture = hwdec_get_tex(p, p->el_hwdec_mapper, n);
+        if (!frame->planes[n].texture)
+            return false;
+    }
+    return true;
+}
+
+static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *bl = frame->user_data;
+    struct pl_video *p = ((struct frame_priv *) bl->priv)->p;
+    if (!ra_pl_get(p->el_hwdec_mapper->ra)) {
+        for (int n = 0; n < frame->num_planes; n++)
+            pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
+    }
+    ra_hwdec_mapper_unmap(p->el_hwdec_mapper);
+}
+#endif
 
 /**
  * @brief Callback to map an mp_image to a pl_frame for rendering.
@@ -135,21 +263,44 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
+    struct mp_image_params par = mpi->params;
 
-    // Upload into recycled textures rather than allocating a new set per frame.
-    fp->tex = tex_group_get(p);
-    if (!upload_mp_image_reuse(p->ra, frame, mpi, fp->tex)) {
-        tex_group_put(p, fp->tex);
-        fp->tex = NULL;
-        talloc_free(mpi); // Clean up the mp_image reference on failure
-        return false;
+    fp->hwdec = p->hwdec_ctx ? ra_hwdec_get(p->hwdec_ctx, mpi->imgfmt) : NULL;
+    if (fp->hwdec) {
+        if (!hwdec_reconfig(p, &p->hwdec_mapper, fp->hwdec, &mpi->params)) {
+            talloc_free(mpi);
+            return false;
+        }
+        par = p->hwdec_mapper->dst_params;
+    }
+
+    mp_image_params_guess_csp(&par);
+    *frame = (struct pl_frame) {
+        .color = par.color,
+        .repr = par.repr,
+        .rotation = par.rotate / 90,
+        .user_data = mpi,
+    };
+
+    if (fp->hwdec) {
+        struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(par.imgfmt);
+        frame->acquire = hwdec_acquire;
+        frame->release = hwdec_release;
+        setup_hwdec_plane_mapping(frame, &desc);
+    } else {
+        if (!ra_upload_mp_image(p->ra, frame, mpi)) {
+            talloc_free(mpi);
+            return false;
+        }
+        // The upload initializes the frame, restore callback data.
+        frame->user_data = mpi;
     }
 
     // Subsampled chroma planes are not co-sited with luma, so libplacebo has to
     // be told where they sit. This also has to agree between the base layer and
     // the enhancement layer below, or the two would be sampled against
     // different grids and would not line up.
-    pl_frame_set_chroma_location(frame, mpi->params.chroma_location);
+    pl_frame_set_chroma_location(frame, par.chroma_location);
 
 #if PL_API_VER >= 367
     // Dolby Vision profile 7 carries a second video track whose residual is
@@ -157,19 +308,43 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     // arrives here as a child image; libplacebo does the actual compositing.
     if (mpi->enhancement_layer) {
         struct mp_image *el = mpi->enhancement_layer;
+        struct mp_image_params el_par = el->params;
+        fp->el_hwdec = p->hwdec_ctx
+            ? ra_hwdec_get(p->hwdec_ctx, el->imgfmt) : NULL;
+        bool el_ok = true;
 
-        fp->el_tex = tex_group_get(p);
-        if (upload_mp_image_reuse(p->ra, &fp->el_frame, el, fp->el_tex)) {
-            pl_frame_set_chroma_location(&fp->el_frame,
-                                         el->params.chroma_location);
+        if (fp->el_hwdec) {
+            if (hwdec_reconfig(p, &p->el_hwdec_mapper, fp->el_hwdec,
+                               &el->params))
+                el_par = p->el_hwdec_mapper->dst_params;
+            else
+                el_ok = false;
+        }
+        mp_image_params_guess_csp(&el_par);
+        fp->el_frame = (struct pl_frame) {
+            .color = el_par.color,
+            .repr = el_par.repr,
+            .user_data = mpi,
+        };
+
+        if (el_ok && fp->el_hwdec) {
+            struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(el_par.imgfmt);
+            fp->el_frame.acquire = hwdec_acquire_el;
+            fp->el_frame.release = hwdec_release_el;
+            setup_hwdec_plane_mapping(&fp->el_frame, &desc);
+        } else if (el_ok) {
+            el_ok = ra_upload_mp_image(p->ra, &fp->el_frame, el);
             fp->el_frame.user_data = mpi;
+        }
+
+        if (el_ok) {
+            pl_frame_set_chroma_location(&fp->el_frame,
+                                         el_par.chroma_location);
             fp->has_el = true;
             frame->enhancement_layer = &fp->el_frame;
         } else {
             // The base layer on its own is still a valid picture, so fall back
             // to it rather than dropping the frame.
-            tex_group_put(p, fp->el_tex);
-            fp->el_tex = NULL;
             mp_msg(p->log, MSGL_WARN, "Failed uploading Dolby Vision "
                    "enhancement layer; rendering base layer only.\n");
         }
@@ -202,15 +377,14 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     // The enhancement layer keeps its own textures, and is not reachable from
     // `frame` once the renderer is done with it.
     if (fp->has_el) {
-        tex_group_put(p, fp->el_tex);
-        fp->el_tex = NULL;
+        if (!fp->el_hwdec)
+            ra_cleanup_pl_frame(p->ra, &fp->el_frame);
         fp->has_el = false;
     }
 #endif
 
-    // Hand the textures back for the next frame instead of destroying them.
-    tex_group_put(p, fp->tex);
-    fp->tex = NULL;
+    if (!fp->hwdec)
+        ra_cleanup_pl_frame(p->ra, frame);
     // Free the mp_image reference itself.
     talloc_free(mpi);
 }
@@ -262,6 +436,8 @@ void pl_video_uninit(struct pl_video **p_ptr) {
     if (!p) return;
 
     ra_next_queue_destroy(&p->queue);
+    ra_hwdec_mapper_free(&p->hwdec_mapper);
+    ra_hwdec_mapper_free(&p->el_hwdec_mapper);
 
     // Clean up all allocated OSD GPU resources
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state_storage.entries); i++) {
@@ -273,15 +449,6 @@ void pl_video_uninit(struct pl_video **p_ptr) {
         ra_next_tex_destroy(p->ra, &p->sub_tex[i]);
     }
     talloc_free(p->sub_tex);
-
-    // The recycled plane textures outlive individual frames, so they are only
-    // released here. The queue is destroyed above, which returns any still-held
-    // groups to the pool first.
-    for (int i = 0; i < p->num_tex_pool; i++) {
-        for (int n = 0; n < 4; n++)
-            ra_next_tex_destroy(p->ra, &p->tex_pool[i][n]);
-    }
-    talloc_free(p->tex_pool);
 
     talloc_free(p);
     *p_ptr = NULL;
@@ -515,6 +682,10 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // sources leaves the tone curve unmanaged and renders them clipped,
     // oversaturated and over-contrasty.
     struct pl_render_params params = pl_render_default_params;
+    // This backend presents one frame at a time and does not interpolate.
+    // Keeping the default mixer would inspect deferred hwdec planes before
+    // their acquire callbacks have mapped the decoder surfaces.
+    params.frame_mixer = NULL;
 
     // Declare a local struct to hold the color adjustment values, starting
     // neutral so that fields the equalizer does not drive (temperature) are
@@ -535,8 +706,12 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // Point the render params' pointer to our local struct.
     params.color_adjustment = &color_adj;
 
-    // Render the mix. libplacebo handles the empty mix case (no video) correctly.
-    if (!ra_next_render_image_mix(p->ra, &mix, &target_frame, &params)) {
+    // This backend does not interpolate, so render the nearest queued frame
+    // directly. Besides avoiding pointless frame-mix setup, pl_render_image()
+    // acquires deferred hwdec surfaces before inspecting their planes.
+    const struct pl_frame *nearest = mix.num_frames
+        ? pl_frame_mix_nearest(&mix) : NULL;
+    if (!ra_next_render_image(p->ra, nearest, &target_frame, &params)) {
         mp_msg(p->log, MSGL_ERR, "Rendering failed.\n");
     }
 }

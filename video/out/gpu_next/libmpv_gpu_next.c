@@ -11,6 +11,8 @@
 #include "string.h"             // for strcmp
 #include "ta/ta_talloc.h"       // for talloc_free, talloc_zero
 #include "video.h"              // for pl_video_check_format, pl_video_init
+#include "video/out/gpu/hwdec.h"
+#include "video/out/gpu/libmpv_gpu.h"
 #include "video/hwdec.h"        // for hwdec_devices_create, hwdec_devices_d...
 #include "video/out/libmpv.h"   // for render_backend, get_mpv_render_param
 #include "video/out/vo.h"       // for vo_frame (ptr only), voctrl_screenshot
@@ -27,6 +29,10 @@ struct mp_rect;
  */
 struct priv {
     struct libmpv_gpu_next_context *context; // Manages the API (e.g., OpenGL)
+    // mpv's mature ra_ctx is retained for hardware-decoder interop only. The
+    // image itself is still rendered by the libplacebo backend above.
+    struct libmpv_gpu_context *interop;
+    struct ra_hwdec_ctx hwdec_ctx;
     struct pl_video *video_engine;           // Manages synchronous libplacebo rendering
 };
 
@@ -78,7 +84,30 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     }
     int err = p->context->fns->init(p->context, params);
     if (err < 0) {
+        talloc_free(p->context->priv);
         talloc_free(p->context);
+        p->context = NULL;
+        return err;
+    }
+
+    // Reuse mpv's existing OpenGL ra_ctx instead of implementing a second
+    // VideoToolbox interop stack. Both contexts wrap the same current OpenGL
+    // context supplied by the API user; ra_ctx only imports decoder surfaces,
+    // while p->context owns rendering and the target FBO.
+    p->interop = talloc_zero(p, struct libmpv_gpu_context);
+    *p->interop = (struct libmpv_gpu_context) {
+        .global = ctx->global,
+        .log = mp_log_new(p, ctx->log, "gpu-next-hwdec"),
+        .fns = &libmpv_gpu_context_gl,
+    };
+    err = p->interop->fns->init(p->interop, params);
+    if (err < 0) {
+        p->context->fns->destroy(p->context);
+        talloc_free(p->context->priv);
+        talloc_free(p->interop->priv);
+        talloc_free(p->interop);
+        talloc_free(p->context);
+        p->interop = NULL;
         p->context = NULL;
         return err;
     }
@@ -86,13 +115,28 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
     // Initialize our synchronous libplacebo rendering engine.
     p->video_engine = pl_video_init(ctx->global, ctx->log, p->context->ra);
     if (!p->video_engine) {
+        p->interop->fns->destroy(p->interop);
+        talloc_free(p->interop->priv);
         p->context->fns->destroy(p->context);
+        talloc_free(p->context->priv);
+        talloc_free(p->interop);
         talloc_free(p->context);
+        p->interop = NULL;
+        p->context = NULL;
         return MPV_ERROR_VO_INIT_FAILED;
     }
 
     // Create hardware decoder devices.
     ctx->hwdec_devs = hwdec_devices_create();
+    p->hwdec_ctx = (struct ra_hwdec_ctx) {
+        .log = ctx->log,
+        .global = ctx->global,
+        .ra_ctx = p->interop->ra_ctx,
+    };
+    // libmpv cannot defer loading through vo_control(), so mirror the legacy
+    // libmpv backend and load all compatible interop drivers up front.
+    ra_hwdec_ctx_init(&p->hwdec_ctx, ctx->hwdec_devs, NULL, true);
+    pl_video_set_hwdec(p->video_engine, &p->hwdec_ctx);
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
     return 0;
 }
@@ -106,10 +150,17 @@ static void destroy(struct render_backend *ctx)
     struct priv *p = ctx->priv;
     if (!p) return;
 
-    hwdec_devices_destroy(ctx->hwdec_devs);
     pl_video_uninit(&p->video_engine);
+    ra_hwdec_ctx_uninit(&p->hwdec_ctx);
+    hwdec_devices_destroy(ctx->hwdec_devs);
+    if (p->interop) {
+        p->interop->fns->destroy(p->interop);
+        talloc_free(p->interop->priv);
+        talloc_free(p->interop);
+    }
     if (p->context) {
         p->context->fns->destroy(p->context); // This destroys the RA
+        talloc_free(p->context->priv);
         talloc_free(p->context);
     }
     talloc_free(p);
@@ -283,10 +334,7 @@ static int set_parameter(struct render_backend *ctx, mpv_render_param param)
 static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
                                   int w, int h, int stride_align, int flags)
 {
-    struct priv *p = ctx->priv;
-    if (!p->context || !p->context->ra)
-        return NULL;
-    return ra_next_dr_alloc(p->context->ra, imgfmt, w, h, stride_align, flags);
+    return NULL;
 }
 
 /*
