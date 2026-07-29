@@ -110,6 +110,10 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         return false;
     }
 
+    // Subsampled chroma planes are not co-sited with luma, so libplacebo has
+    // to be told where they sit, or chroma is sampled off-grid.
+    pl_frame_set_chroma_location(frame, mpi->params.chroma_location);
+
     // Store a pointer back to the original mp_image. This is used to get a unique
     // signature for the frame and to access metadata (like colorspace) later.
     frame->user_data = mpi;
