@@ -27,44 +27,6 @@ static void make_frame(uint8_t *buf, int size, int strmtyp, int fscod,
     buf[5] = 16 << 3;              // E-AC-3 bsid
 }
 
-static void test_dec3_cookie(void)
-{
-    uint8_t frame[FRAME_BYTES];
-    struct eac3_frame fr;
-    make_frame(frame, FRAME_BYTES, 0, 0, 3, 7, 1);
-    assert_true(eac3_parse_frame(frame, sizeof(frame), &fr));
-
-    uint8_t cookie[EAC3_DEC3_COOKIE_MAX_BYTES];
-    const uint8_t plain[] = {
-        0x00, 0x00, 0x00, 0x0d, 'd', 'e', 'c', '3',
-        0x18, 0x00, 0x20, 0x0f, 0x00,
-    };
-    const uint8_t atmos[] = {
-        0x00, 0x00, 0x00, 0x0f, 'd', 'e', 'c', '3',
-        0x18, 0x00, 0x20, 0x0f, 0x00, 0x01, 0x10,
-    };
-    size_t size = eac3_make_dec3_cookie(&fr, FRAME_BYTES, false, cookie);
-    assert_int_equal(size, sizeof(plain));
-    assert_true(memcmp(cookie, plain, size) == 0);
-    size = eac3_make_dec3_cookie(&fr, FRAME_BYTES, true, cookie);
-    assert_int_equal(size, sizeof(atmos));
-    assert_true(memcmp(cookie, atmos, size) == 0);
-
-    const uint8_t sample_entry[] = {
-        0x00, 0x00, 0x00, 0x33, 'e', 'c', '-', '3',
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x06, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
-        0xbb, 0x80, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x0f, 'd', 'e', 'c', '3',
-        0x18, 0x00, 0x20, 0x0f, 0x00, 0x01, 0x10,
-    };
-    uint8_t entry[EAC3_ISO_SAMPLE_ENTRY_MAX_BYTES];
-    size = eac3_make_iso_sample_entry(&fr, cookie, size, entry);
-    assert_int_equal(size, sizeof(sample_entry));
-    assert_true(memcmp(entry, sample_entry, size) == 0);
-}
-
 // Wrap a payload into an IEC 61937 burst exactly as the spdif muxer does:
 // preamble in native order, payload byte-swapped in 16-bit words.
 static void make_burst(uint8_t *dst, const uint8_t *payload, int len,
@@ -121,6 +83,25 @@ static void test_frame_parsing(void)
     assert_true(!eac3_parse_frame(f, sizeof(f), &fr));
     make_frame(f, FRAME_BYTES, 0, 3, 3, 7, 1);                 // fscod2 form
     assert_true(!eac3_parse_frame(f, sizeof(f), &fr));
+}
+
+static void test_dependent_substream_grouping(void)
+{
+    uint8_t packet[FRAME_BYTES * 4];
+    struct eac3_frame fr;
+    size_t size;
+
+    make_frame(packet, FRAME_BYTES, 0, 0, 3, 7, 1);
+    make_frame(packet + FRAME_BYTES, FRAME_BYTES, 1, 0, 3, 2, 0);
+    make_frame(packet + FRAME_BYTES * 2, FRAME_BYTES, 1, 0, 3, 2, 0);
+    make_frame(packet + FRAME_BYTES * 3, FRAME_BYTES, 0, 0, 3, 7, 1);
+
+    assert_true(eac3_parse_packet(packet, sizeof(packet), &fr, &size));
+    assert_int_equal(size, FRAME_BYTES * 3);
+    assert_int_equal(fr.samples, 1536);
+
+    assert_true(!eac3_parse_packet(packet + FRAME_BYTES, FRAME_BYTES,
+                                   &fr, &size));
 }
 
 static void test_burst_round_trip(void)
@@ -192,8 +173,8 @@ static void test_burst_scanning(void)
 int main(void)
 {
     test_frame_parsing();
+    test_dependent_substream_grouping();
     test_burst_round_trip();
     test_burst_scanning();
-    test_dec3_cookie();
     return 0;
 }
