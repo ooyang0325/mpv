@@ -47,6 +47,8 @@ enum af_format {
     AF_FORMAT_S_EAC3,
     AF_FORMAT_S_MP3,
     AF_FORMAT_S_TRUEHD,
+    // 24-bit DoP 1.1 words in a 32-bit container.
+    AF_FORMAT_S_DOP,
 
     AF_FORMAT_COUNT
 };

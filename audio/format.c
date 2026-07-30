@@ -33,6 +33,8 @@ int af_fmt_to_bytes(int format)
     case AF_FORMAT_FLOAT:   return 4;
     case AF_FORMAT_DOUBLE:  return 8;
     }
+    if (format == AF_FORMAT_S_DOP)
+        return 4;
     if (af_fmt_is_spdif(format))
         return 2;
     return 0;
@@ -135,6 +137,7 @@ const char *af_fmt_to_str(int format)
     case AF_FORMAT_S_EAC3:      return "spdif-eac3";
     case AF_FORMAT_S_MP3:       return "spdif-mp3";
     case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
+    case AF_FORMAT_S_DOP:       return "dop";
     }
     return "??";
 }
@@ -262,6 +265,7 @@ int af_format_sample_alignment(int format)
     case AF_FORMAT_S_EAC3:      return 24576 / 4;
     case AF_FORMAT_S_MP3:       return 4608 / 4;
     case AF_FORMAT_S_TRUEHD:    return 61440 / 16;
+    case AF_FORMAT_S_DOP:       return 2;
     default:                    return 1;
     }
 }

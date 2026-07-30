@@ -35,6 +35,7 @@
  */
 
 #include <stdatomic.h>
+#include <math.h>
 
 #include <CoreAudio/HostTime.h>
 
@@ -75,6 +76,9 @@ struct priv {
     // format we changed the stream to, and the original format to restore
     AudioStreamBasicDescription stream_asbd;
     AudioStreamBasicDescription original_asbd;
+    AudioStreamBasicDescription original_virtual_asbd;
+    bool changed_virtual_format;
+    bool dop_high_aligned;
 
     // Output s16 physical format, float32 virtual format, ac3/dts mpv format
     bool spdif_hack;
@@ -187,6 +191,12 @@ static OSStatus render_cb_compressed(
 
     ao_read_data(ao, &buf.mData, pseudo_frames, end, NULL, true, true);
 
+    if (ao->format == AF_FORMAT_S_DOP && p->dop_high_aligned) {
+        uint32_t *samples = buf.mData;
+        for (int n = 0; n < pseudo_frames * ao->channels.num; n++)
+            samples[n] <<= 8;
+    }
+
     if (p->spdif_hack)
         bad_hack_mygodwhy(buf.mData, pseudo_frames * ao->channels.num);
 
@@ -219,7 +229,8 @@ static int select_stream(struct ao *ao)
             continue;
         }
 
-        if (af_fmt_is_pcm(ao->format) || p->spdif_hack ||
+        if (af_fmt_is_pcm(ao->format) || ao->format == AF_FORMAT_S_DOP ||
+            p->spdif_hack ||
             ca_stream_supports_compressed(ao, streams[i]))
         {
             MP_VERBOSE(ao, "Using substream %d/%zd.\n", i, n_streams);
@@ -242,6 +253,22 @@ coreaudio_error:
     return -1;
 }
 
+static bool dop_asbd_is_supported(const AudioStreamBasicDescription *asbd,
+                                  int samplerate, int channels)
+{
+    uint32_t flags = asbd->mFormatFlags;
+    return asbd->mFormatID == kAudioFormatLinearPCM &&
+           fabs(asbd->mSampleRate - samplerate) < 1.0 &&
+           asbd->mChannelsPerFrame == channels &&
+           asbd->mBytesPerFrame == 4 * channels &&
+           asbd->mFramesPerPacket == 1 &&
+           (asbd->mBitsPerChannel == 24 || asbd->mBitsPerChannel == 32) &&
+           (flags & kAudioFormatFlagIsSignedInteger) &&
+           !(flags & (kAudioFormatFlagIsFloat |
+                      kAudioFormatFlagIsBigEndian |
+                      kAudioFormatFlagIsNonInterleaved));
+}
+
 static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
 {
     struct priv *p = ao->priv;
@@ -262,7 +289,18 @@ static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
     CHECK_CA_ERROR("could not get number of stream formats");
 
     for (int j = 0; j < n_formats; j++) {
-        AudioStreamBasicDescription *stream_asbd = &formats[j].mFormat;
+        AudioStreamBasicDescription candidate = formats[j].mFormat;
+        AudioStreamBasicDescription *stream_asbd = &candidate;
+
+        if (ao->format == AF_FORMAT_S_DOP) {
+            AudioValueRange range = formats[j].mSampleRateRange;
+            if (asbd.mSampleRate >= range.mMinimum &&
+                asbd.mSampleRate <= range.mMaximum)
+                stream_asbd->mSampleRate = asbd.mSampleRate;
+            if (!dop_asbd_is_supported(stream_asbd, ao->samplerate,
+                                       ao->channels.num))
+                continue;
+        }
 
         ca_print_asbd(ao, "- ", stream_asbd);
 
@@ -280,6 +318,24 @@ static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
     return 0;
 coreaudio_error:
     return -1;
+}
+
+static void restore_stream_formats(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->original_asbd.mFormatID)
+        return;
+
+    if (!ca_change_physical_format_sync(ao, p->stream, p->original_asbd))
+        MP_WARN(ao, "can't revert to original device format\n");
+    p->original_asbd = (AudioStreamBasicDescription){0};
+
+    if (p->changed_virtual_format) {
+        OSStatus err = CA_SET(p->stream, kAudioStreamPropertyVirtualFormat,
+                              &p->original_virtual_asbd);
+        CHECK_CA_WARN("can't revert to original virtual format");
+        p->changed_virtual_format = false;
+    }
 }
 
 static int init(struct ao *ao)
@@ -332,10 +388,21 @@ static int init(struct ao *ao)
     err = CA_GET(p->stream, kAudioStreamPropertyPhysicalFormat,
                  &p->original_asbd);
     CHECK_CA_ERROR("could not get stream's original physical format");
+    err = CA_GET(p->stream, kAudioStreamPropertyVirtualFormat,
+                 &p->original_virtual_asbd);
+    CHECK_CA_ERROR("could not get stream's original virtual format");
 
     // Even if changing the physical format fails, we can try using the current
     // virtual format.
     ca_change_physical_format_sync(ao, p->stream, hwfmt);
+
+    if (original_format == AF_FORMAT_S_DOP &&
+        !ca_asbd_equals(&p->original_virtual_asbd, &hwfmt))
+    {
+        err = CA_SET(p->stream, kAudioStreamPropertyVirtualFormat, &hwfmt);
+        CHECK_CA_ERROR("could not set DoP virtual format");
+        p->changed_virtual_format = true;
+    }
 
     if (!ca_init_chmap(ao, p->device))
         goto coreaudio_error;
@@ -351,12 +418,25 @@ static int init(struct ao *ao)
         goto coreaudio_error;
     }
 
-    int new_format = ca_asbd_to_mp_format(&p->stream_asbd);
+    if (original_format == AF_FORMAT_S_DOP) {
+        if (!dop_asbd_is_supported(&p->stream_asbd, ao->samplerate,
+                                   ao->channels.num))
+        {
+            MP_ERR(ao, "Device has no exact integer PCM carrier for DoP.\n");
+            goto coreaudio_error;
+        }
+        p->dop_high_aligned =
+            p->stream_asbd.mBitsPerChannel == 32 ||
+            (p->stream_asbd.mFormatFlags & kAudioFormatFlagIsAlignedHigh);
+        ao->format = AF_FORMAT_S_DOP;
+    } else {
+        int new_format = ca_asbd_to_mp_format(&p->stream_asbd);
 
-    // If both old and new formats are spdif, avoid changing it due to the
-    // imperfect mapping between mp and CA formats.
-    if (!(af_fmt_is_spdif(ao->format) && af_fmt_is_spdif(new_format)))
-        ao->format = new_format;
+        // If both old and new formats are spdif, avoid changing it due to the
+        // imperfect mapping between mp and CA formats.
+        if (!(af_fmt_is_spdif(ao->format) && af_fmt_is_spdif(new_format)))
+            ao->format = new_format;
+    }
 
     if (!ao->format || af_fmt_is_planar(ao->format)) {
         MP_ERR(ao, "hardware format not supported\n");
@@ -405,6 +485,7 @@ static int init(struct ao *ao)
 coreaudio_error:
     err = enable_property_listener(ao, false);
     CHECK_CA_WARN("can't remove format change listener");
+    restore_stream_formats(ao);
     err = ca_unlock_device(p->device, &p->hog_pid);
     CHECK_CA_WARN("can't release hog mode");
 coreaudio_error_nounlock:
@@ -425,8 +506,7 @@ static void uninit(struct ao *ao)
     err = AudioDeviceDestroyIOProcID(p->device, p->render_cb);
     CHECK_CA_WARN("failed to remove device render callback");
 
-    if (!ca_change_physical_format_sync(ao, p->stream, p->original_asbd))
-        MP_WARN(ao, "can't revert to original device format\n");
+    restore_stream_formats(ao);
 
     err = ca_enable_mixing(ao, p->device, p->changed_mixing);
     CHECK_CA_WARN("can't re-enable mixing");

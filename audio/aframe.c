@@ -32,7 +32,7 @@ struct mp_aframe {
     AVFrame *av_frame;
     // We support channel layouts different from AVFrame channel masks
     struct mp_chmap chmap;
-    // We support spdif formats, which are allocated as AV_SAMPLE_FMT_S16.
+    // Passthrough formats use a PCM-sized AVFrame only as opaque storage.
     int format;
     double pts;
     double speed;
@@ -308,7 +308,8 @@ bool mp_aframe_set_format(struct mp_aframe *frame, int format)
     if (av_format == AV_SAMPLE_FMT_NONE && format) {
         if (!af_fmt_is_spdif(format))
             return false;
-        av_format = AV_SAMPLE_FMT_S16;
+        av_format = format == AF_FORMAT_S_DOP ? AV_SAMPLE_FMT_S32
+                                               : AV_SAMPLE_FMT_S16;
     }
     frame->format = format;
     frame->av_frame->format = av_format;

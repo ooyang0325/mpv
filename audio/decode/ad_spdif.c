@@ -26,6 +26,7 @@
 
 #include "audio/aframe.h"
 #include "audio/chmap_avchannel.h"
+#include "audio/dop.h"
 #include "audio/format.h"
 #include "common/av_common.h"
 #include "common/codecs.h"
@@ -51,9 +52,21 @@ struct spdifContext {
     struct mp_aframe *fmt;
     int              sstride;
     struct mp_aframe_pool *pool;
+    struct mp_dop_state dop;
+    bool             use_dop;
+    bool             dop_planar;
+    bool             dop_lsbf;
 
     struct mp_decoder public;
 };
+
+static bool codec_is_dsd(enum AVCodecID codec_id)
+{
+    return codec_id == AV_CODEC_ID_DSD_LSBF ||
+           codec_id == AV_CODEC_ID_DSD_MSBF ||
+           codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR ||
+           codec_id == AV_CODEC_ID_DSD_MSBF_PLANAR;
+}
 
 #if LIBAVFORMAT_VERSION_MAJOR < 61
 static int write_packet(void *p, uint8_t *buf, int buf_size)
@@ -90,6 +103,36 @@ static void ad_spdif_destroy(struct mp_filter *da)
         spdif_ctx->lavf_ctx = NULL;
     }
     mp_free_av_packet(&spdif_ctx->avpkt);
+    if (spdif_ctx->use_dop)
+        spdif_ctx->codec->audio_pipeline = NULL;
+}
+
+static int init_dop(struct mp_filter *da)
+{
+    struct spdifContext *ctx = da->priv;
+    struct mp_codec_params *codec = ctx->codec;
+
+    if (codec->samplerate < 2 || codec->samplerate % 2 ||
+        codec->channels.num < 1 || codec->channels.num > MP_NUM_CHANNELS)
+    {
+        MP_ERR(da, "Invalid DSD format: %d Hz, %d channels.\n",
+               codec->samplerate, codec->channels.num);
+        return -1;
+    }
+
+    ctx->fmt = mp_aframe_create();
+    talloc_steal(ctx, ctx->fmt);
+    if (!mp_aframe_set_chmap(ctx->fmt, &codec->channels) ||
+        !mp_aframe_set_format(ctx->fmt, AF_FORMAT_S_DOP) ||
+        !mp_aframe_set_rate(ctx->fmt, codec->samplerate / 2))
+    {
+        MP_ERR(da, "Could not configure DoP output.\n");
+        return -1;
+    }
+
+    ctx->sstride = mp_aframe_get_sstride(ctx->fmt);
+    codec->audio_pipeline = "DoP 1.1 passthrough";
+    return 0;
 }
 
 static void determine_codec_params(struct mp_filter *da, AVPacket *pkt,
@@ -319,6 +362,51 @@ static void ad_spdif_process(struct mp_filter *da)
     struct mp_aframe *out = NULL;
     double pts = mpkt->pts;
 
+    if (spdif_ctx->use_dop) {
+        if (!spdif_ctx->fmt && init_dop(da) < 0)
+            goto dop_fail;
+
+        int frames = mp_dop_output_frames(&spdif_ctx->dop, mpkt->len,
+                                          spdif_ctx->codec->channels.num);
+        if (frames < 0) {
+            MP_ERR(da, "Malformed DSD packet.\n");
+            goto dop_fail;
+        }
+
+        if (frames) {
+            out = mp_aframe_new_ref(spdif_ctx->fmt);
+            if (mp_aframe_pool_allocate(spdif_ctx->pool, out, frames) < 0)
+                goto dop_fail;
+
+            uint8_t **data = mp_aframe_get_data_rw(out);
+            if (!data ||
+                mp_dop_pack(&spdif_ctx->dop, (uint32_t *)data[0],
+                            mpkt->buffer, mpkt->len,
+                            spdif_ctx->codec->channels.num,
+                            spdif_ctx->dop_planar,
+                            spdif_ctx->dop_lsbf) != frames)
+                goto dop_fail;
+
+            mp_aframe_set_pts(out, pts);
+        } else if (mp_dop_pack(&spdif_ctx->dop, NULL, mpkt->buffer,
+                               mpkt->len, spdif_ctx->codec->channels.num,
+                               spdif_ctx->dop_planar,
+                               spdif_ctx->dop_lsbf) < 0) {
+            goto dop_fail;
+        }
+
+        talloc_free(mpkt);
+        if (out)
+            mp_pin_in_write(da->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
+        return;
+
+dop_fail:
+        talloc_free(mpkt);
+        TA_FREEP(&out);
+        mp_filter_internal_mark_failed(da);
+        return;
+    }
+
     if (!spdif_ctx->avpkt) {
         spdif_ctx->avpkt = av_packet_alloc();
         MP_HANDLE_OOM(spdif_ctx->avpkt);
@@ -372,6 +460,10 @@ static const int codecs[] = {
     AV_CODEC_ID_EAC3,
     AV_CODEC_ID_MP3,
     AV_CODEC_ID_TRUEHD,
+    AV_CODEC_ID_DSD_LSBF,
+    AV_CODEC_ID_DSD_MSBF,
+    AV_CODEC_ID_DSD_LSBF_PLANAR,
+    AV_CODEC_ID_DSD_MSBF_PLANAR,
     AV_CODEC_ID_NONE
 };
 
@@ -411,18 +503,29 @@ struct mp_decoder_list *select_spdif_codec(const char *codec, const char *pref)
     if (!spdif_allowed)
         return list;
 
+    enum AVCodecID codec_id = mp_codec_to_av_codec_id(codec);
+    bool dop = codec_is_dsd(codec_id);
     const char *suffix_name = dts_hd_allowed ? "dts_hd" : codec;
     char name[80];
-    snprintf(name, sizeof(name), "spdif_%s", suffix_name);
+    snprintf(name, sizeof(name), "%s_%s", dop ? "dop" : "spdif",
+             suffix_name);
     mp_add_decoder(list, codec, name,
-                   "libavformat/spdifenc audio pass-through decoder");
+                   dop ? "DSD over PCM pass-through decoder"
+                       : "libavformat/spdifenc audio pass-through decoder");
     return list;
+}
+
+static void ad_spdif_reset(struct mp_filter *da)
+{
+    struct spdifContext *ctx = da->priv;
+    mp_dop_reset(&ctx->dop);
 }
 
 static const struct mp_filter_info ad_spdif_filter = {
     .name = "ad_spdif",
     .priv_size = sizeof(struct spdifContext),
     .process = ad_spdif_process,
+    .reset = ad_spdif_reset,
     .destroy = ad_spdif_destroy,
 };
 
@@ -450,11 +553,18 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     spdif_ctx->codec_id = mp_codec_to_av_codec_id(codec->codec);
 
-
     if (spdif_ctx->codec_id == AV_CODEC_ID_NONE) {
         talloc_free(da);
         return NULL;
     }
+
+    spdif_ctx->use_dop = codec_is_dsd(spdif_ctx->codec_id);
+    spdif_ctx->dop_planar =
+        spdif_ctx->codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR ||
+        spdif_ctx->codec_id == AV_CODEC_ID_DSD_MSBF_PLANAR;
+    spdif_ctx->dop_lsbf =
+        spdif_ctx->codec_id == AV_CODEC_ID_DSD_LSBF ||
+        spdif_ctx->codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR;
 
     const AVCodecDescriptor *desc = avcodec_descriptor_get(spdif_ctx->codec_id);
     if (desc)

@@ -147,6 +147,20 @@ bool check_ca_st(struct ao *ao, int level, OSStatus code, const char *message)
 static void ca_fill_asbd_raw(AudioStreamBasicDescription *asbd, int mp_format,
                              int samplerate, int num_channels)
 {
+    if (mp_format == AF_FORMAT_S_DOP) {
+        *asbd = (AudioStreamBasicDescription){
+            .mSampleRate       = samplerate,
+            .mFormatID         = kAudioFormatLinearPCM,
+            .mFormatFlags      = kAudioFormatFlagIsSignedInteger,
+            .mBytesPerPacket   = 4 * num_channels,
+            .mFramesPerPacket  = 1,
+            .mBytesPerFrame    = 4 * num_channels,
+            .mChannelsPerFrame = num_channels,
+            .mBitsPerChannel   = 24,
+        };
+        return;
+    }
+
     asbd->mSampleRate       = samplerate;
     // Set "AC3" for other spdif formats too - unknown if that works.
     asbd->mFormatID         = af_fmt_is_spdif(mp_format) ?
@@ -220,6 +234,9 @@ bool ca_asbd_equals(const AudioStreamBasicDescription *a,
 int ca_asbd_to_mp_format(const AudioStreamBasicDescription *asbd)
 {
     for (int fmt = 1; fmt < AF_FORMAT_COUNT; fmt++) {
+        // DoP is deliberately indistinguishable from PCM at the HAL boundary.
+        if (fmt == AF_FORMAT_S_DOP)
+            continue;
         AudioStreamBasicDescription mp_asbd = {0};
         ca_fill_asbd_raw(&mp_asbd, fmt, asbd->mSampleRate, asbd->mChannelsPerFrame);
         if (ca_asbd_equals(&mp_asbd, asbd))

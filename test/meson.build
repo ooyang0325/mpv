@@ -110,6 +110,12 @@ if darwin
     test('eac3-spdif', eac3_spdif)
 endif
 
+dop = executable('dop', files('dop.c'),
+                 include_directories: incdir,
+                 objects: libmpv.extract_objects('audio/dop.c'),
+                 link_with: test_utils)
+test('dop', dop)
+
 format = executable('format', files('format.c'), include_directories: incdir, link_with: test_utils)
 test('format', format)
 
