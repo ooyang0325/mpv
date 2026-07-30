@@ -451,6 +451,143 @@ static void audio_resume(struct ao *ao)
     CHECK_CA_WARN("can't start audio device");
 }
 
+// Volume is handled by the device itself rather than by scaling the samples, since the
+// whole point of this output is to hand the source's own bits to the hardware. Devices
+// expose either a single main volume control or one per channel, and plenty (HDMI and
+// most S/PDIF among them) expose none at all, in which case these report failure and the
+// player falls back to its software gain.
+
+static bool ca_volume_elements(struct ao *ao, AudioObjectPropertyElement *elements,
+                               int *count)
+{
+    struct priv *p = ao->priv;
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioDevicePropertyVolumeScalar,
+        .mScope    = kAudioDevicePropertyScopeOutput,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+
+    if (AudioObjectHasProperty(p->device, &addr)) {
+        elements[0] = kAudioObjectPropertyElementMain;
+        *count = 1;
+        return true;
+    }
+
+    // No main control, so drive the channels the device nominates as its stereo pair.
+    uint32_t stereo[2] = {1, 2};
+    AudioObjectPropertyAddress pref = {
+        .mSelector = kAudioDevicePropertyPreferredChannelsForStereo,
+        .mScope    = kAudioDevicePropertyScopeOutput,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+    uint32_t size = sizeof(stereo);
+    AudioObjectGetPropertyData(p->device, &pref, 0, NULL, &size, stereo);
+
+    *count = 0;
+    for (int n = 0; n < 2; n++) {
+        addr.mElement = stereo[n];
+        if (AudioObjectHasProperty(p->device, &addr))
+            elements[(*count)++] = stereo[n];
+    }
+    return *count > 0;
+}
+
+static int get_volume(struct ao *ao, float *vol)
+{
+    struct priv *p = ao->priv;
+    AudioObjectPropertyElement elements[2];
+    int count;
+
+    if (!ca_volume_elements(ao, elements, &count))
+        return CONTROL_FALSE;
+
+    // Report the loudest channel, so a device left with unbalanced channels does not read
+    // back as quieter than it is.
+    float scalar = 0;
+    for (int n = 0; n < count; n++) {
+        AudioObjectPropertyAddress addr = {
+            .mSelector = kAudioDevicePropertyVolumeScalar,
+            .mScope    = kAudioDevicePropertyScopeOutput,
+            .mElement  = elements[n],
+        };
+        float channel;
+        uint32_t size = sizeof(channel);
+        OSStatus err = AudioObjectGetPropertyData(p->device, &addr, 0, NULL, &size,
+                                                  &channel);
+        if (err != noErr)
+            return CONTROL_FALSE;
+        if (channel > scalar)
+            scalar = channel;
+    }
+
+    *vol = scalar * 100.0;
+    return CONTROL_OK;
+}
+
+static int set_volume(struct ao *ao, float *vol)
+{
+    struct priv *p = ao->priv;
+    AudioObjectPropertyElement elements[2];
+    int count;
+
+    if (!ca_volume_elements(ao, elements, &count))
+        return CONTROL_FALSE;
+
+    float scalar = MPCLAMP(*vol / 100.0, 0.0, 1.0);
+    for (int n = 0; n < count; n++) {
+        AudioObjectPropertyAddress addr = {
+            .mSelector = kAudioDevicePropertyVolumeScalar,
+            .mScope    = kAudioDevicePropertyScopeOutput,
+            .mElement  = elements[n],
+        };
+        OSStatus err = AudioObjectSetPropertyData(p->device, &addr, 0, NULL,
+                                                  sizeof(scalar), &scalar);
+        if (err != noErr) {
+            CHECK_CA_WARN("could not set device volume");
+            return CONTROL_FALSE;
+        }
+    }
+    return CONTROL_OK;
+}
+
+static int get_mute(struct ao *ao, bool *muted)
+{
+    struct priv *p = ao->priv;
+    uint32_t value;
+    OSStatus err = CA_GET_O(p->device, kAudioDevicePropertyMute, &value);
+    if (err != noErr)
+        return CONTROL_FALSE;
+    *muted = value;
+    return CONTROL_OK;
+}
+
+static int set_mute(struct ao *ao, bool *muted)
+{
+    struct priv *p = ao->priv;
+    uint32_t value = *muted;
+    OSStatus err = CA_SET_O(p->device, kAudioDevicePropertyMute, &value);
+    if (err != noErr) {
+        CHECK_CA_WARN("could not set device mute");
+        return CONTROL_FALSE;
+    }
+    return CONTROL_OK;
+}
+
+static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+{
+    switch (cmd) {
+    case AOCONTROL_GET_VOLUME:
+        return get_volume(ao, arg);
+    case AOCONTROL_SET_VOLUME:
+        return set_volume(ao, arg);
+    case AOCONTROL_GET_MUTE:
+        return get_mute(ao, arg);
+    case AOCONTROL_SET_MUTE:
+        return set_mute(ao, arg);
+    }
+    return CONTROL_UNKNOWN;
+}
+
 #define OPT_BASE_STRUCT struct priv
 
 const struct ao_driver audio_out_coreaudio_exclusive = {
@@ -458,6 +595,7 @@ const struct ao_driver audio_out_coreaudio_exclusive = {
     .name      = "coreaudio_exclusive",
     .uninit    = uninit,
     .init      = init,
+    .control   = control,
     .reset     = audio_pause,
     .start     = audio_resume,
     .list_devs = ca_get_device_list,
