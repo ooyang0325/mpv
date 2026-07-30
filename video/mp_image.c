@@ -563,6 +563,13 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.sys_orig = src->params.sys_orig;
     dst->params.no_dovi = src->params.no_dovi;
     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+    dst->dovi_residual_mode = src->dovi_residual_mode;
+    dst->dovi_el_paired = src->dovi_el_paired;
+    dst->dovi_el_pairs = src->dovi_el_pairs;
+    dst->dovi_el_misses = src->dovi_el_misses;
+    dst->dovi_el_late = src->dovi_el_late;
+    dst->dovi_bl_queue = src->dovi_bl_queue;
+    dst->dovi_el_queue = src->dovi_el_queue;
 
     // ensure colorspace consistency
     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);
@@ -1185,8 +1192,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     if (sd) {
 #ifdef PL_HAVE_LAV_DOLBY_VISION
         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
-#if PL_API_VER < 364
         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+        dst->dovi_residual_mode = header->disable_residual_flag ? 1 : 2;
+#if PL_API_VER < 364
         if (header->disable_residual_flag)
 #elif PL_API_VER < 370
         if (pl_avdovi_metadata_supported(metadata))

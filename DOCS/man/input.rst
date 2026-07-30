@@ -3006,6 +3006,22 @@ Property list
     ``video-frame-info/repeat``
         Whether the frame must be delayed when decoding.
 
+    ``video-frame-info/dolby-vision-rpu``,
+    ``video-frame-info/dolby-vision-mode``,
+    ``video-frame-info/dolby-vision-composition``
+        Current Dolby Vision metadata, FEL/MEL mode, and enhancement-layer
+        composition state.
+
+    ``video-frame-info/dolby-vision-el-paired``,
+    ``video-frame-info/dolby-vision-el-format``,
+    ``video-frame-info/dolby-vision-el-pairs``,
+    ``video-frame-info/dolby-vision-el-misses``,
+    ``video-frame-info/dolby-vision-el-late``,
+    ``video-frame-info/dolby-vision-bl-queue``,
+    ``video-frame-info/dolby-vision-el-queue``
+        Current Profile 7 pairing status, cumulative pairing counters, and
+        base/enhancement-layer queue depths.
+
     ``video-frame-info/gop-timecode``
         String with the GOP timecode encoded in the frame.
 
@@ -3624,6 +3640,12 @@ Property list
         the name of the sample format. If the track is video, this will be the
         name of the pixel format.
 
+    ``track-list/N/codec-level``, ``track-list/N/bits-per-sample``
+        Codec level and coded sample depth, when reported by FFmpeg.
+
+    ``track-list/N/audio-pipeline``
+        Live decoder output route, when exposed by the selected decoder.
+
     ``track-list/N/audio-channels`` (deprecated)
         Deprecated alias for ``track-list/N/demux-channel-count``.
 
@@ -3637,9 +3659,11 @@ Property list
         values currently. It's possible that future mpv versions will make
         these properties unavailable instead in this case.
 
-    ``track-list/N/dolby-vision-profile``, ``track-list/N/dolby-vision-level``
+    ``track-list/N/dolby-vision-profile``, ``track-list/N/dolby-vision-level``,
+    ``track-list/N/dolby-vision-enhancement-layer``
         Dolby Vision profile and level. May not be available if the container
-        does not provide this information.
+        does not provide this information. ``dolby-vision-enhancement-layer``
+        reports whether the presentation carries a Profile 7 enhancement layer.
 
     ``track-list/N/metadata``,
         Works like the ``metadata`` property, but it accesses metadata that is
@@ -3675,9 +3699,12 @@ Property list
                 "codec"             MPV_FORMAT_STRING
                 "codec-desc"        MPV_FORMAT_STRING
                 "codec-profile"     MPV_FORMAT_STRING
+                "codec-level"       MPV_FORMAT_INT64
+                "bits-per-sample"   MPV_FORMAT_INT64
                 "ff-index"          MPV_FORMAT_INT64
                 "decoder"           MPV_FORMAT_STRING
                 "decoder-desc"      MPV_FORMAT_STRING
+                "audio-pipeline"    MPV_FORMAT_STRING
                 "demux-w"           MPV_FORMAT_INT64
                 "demux-h"           MPV_FORMAT_INT64
                 "demux-crop-x"      MPV_FORMAT_INT64
@@ -3699,6 +3726,7 @@ Property list
                 "replaygain-album-gain" MPV_FORMAT_DOUBLE
                 "dolby-vision-profile" MPV_FORMAT_INT64
                 "dolby-vision-level" MPV_FORMAT_INT64
+                "dolby-vision-enhancement-layer" MPV_FORMAT_FLAG
                 "metadata"           MPV_FORMAT_NODE_MAP
                     (key and string value for each metadata entry)
 

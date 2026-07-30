@@ -134,6 +134,9 @@ struct mp_codec_params {
     // Usually corresponds to AVCodec.long_name
     const char *_Atomic decoder_desc;
 
+    // Live decoder output route.
+    const char *_Atomic audio_pipeline;
+
     // Usually a FourCC, exact meaning depends on codec.
     unsigned int codec_tag;
 

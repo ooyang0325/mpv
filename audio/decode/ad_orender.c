@@ -686,6 +686,11 @@ static void ad_orender_process(struct mp_filter *da)
             p->dl->overlay_clear();
         }
         p->active_path = path;
+        p->codec->audio_pipeline = path == PATH_SPATIAL
+                                 ? "liborender spatial"
+                                 : p->host_decoder_idx == HOST_DEC_SPDIF
+                                   ? "host compressed passthrough"
+                                   : "host decoded PCM";
     }
 
     if (host)
@@ -710,6 +715,7 @@ static void ad_orender_destroy(struct mp_filter *da)
 {
     struct priv *p = da->priv;
     clear_probe_packets(p);
+    p->codec->audio_pipeline = NULL;
     /* The native child is a talloc child of `da` and is freed with it; the
      * engine is an FFI handle we must release explicitly. The codec profile
      * buffer is a talloc child of p->codec (not of `da`), so it correctly
@@ -846,6 +852,11 @@ static struct mp_decoder *create(struct mp_filter *parent,
     bool start_host = p->force_host || !p->renderer ||
                       (!p->source_spatial && p->dl->channel_mode(p->renderer) != 1);
     p->dl->overlay_set_rendering(start_host ? 0 : 1);
+    codec->audio_pipeline = start_host
+                          ? (p->host_decoder_idx == HOST_DEC_SPDIF
+                             ? "host compressed passthrough"
+                             : "host decoded PCM")
+                          : "liborender spatial";
 
     /* Official-cased codec name. No "(orender)" suffix: the decoder already shows
      * up as the trailing "[orender]" bracket (codec != decoder). The Atmos /

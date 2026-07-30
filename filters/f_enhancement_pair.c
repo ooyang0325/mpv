@@ -43,6 +43,9 @@ struct priv {
 
     bool bl_eof;
     bool el_eof;
+    uint64_t paired;
+    uint64_t missed;
+    uint64_t late;
 };
 
 static int pts_cmp(double a, double b)
@@ -99,6 +102,8 @@ static struct mp_image *take_head(struct mp_image ***queue, int *num)
 // mirror them onto the BL here. This keeps DV bookkeeping local.
 static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
 {
+    if (el->dovi_residual_mode)
+        bl->dovi_residual_mode = el->dovi_residual_mode;
     if (bl->params.no_dovi || bl->dovi || !el->dovi)
         return;
     bl->dovi = av_buffer_ref(el->dovi);
@@ -112,6 +117,16 @@ static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
     bl->params.color.hdr.max_luma = el->params.color.hdr.max_luma;
     bl->params.color.hdr.max_pq_y = el->params.color.hdr.max_pq_y;
     bl->params.color.hdr.avg_pq_y = el->params.color.hdr.avg_pq_y;
+}
+
+static void set_pair_diagnostics(struct priv *p, struct mp_image *bl, bool paired)
+{
+    bl->dovi_el_paired = paired;
+    bl->dovi_el_pairs = p->paired;
+    bl->dovi_el_misses = p->missed;
+    bl->dovi_el_late = p->late;
+    bl->dovi_bl_queue = p->num_bl_pending;
+    bl->dovi_el_queue = p->num_el_pending;
 }
 
 static void pair_process(struct mp_filter *f)
@@ -139,6 +154,7 @@ static void pair_process(struct mp_filter *f)
 
         // EL older than BL: its BL partner already left or never arrived.
         if (p->num_el_pending > 0 && cmp < 0) {
+            p->late++;
             pop_head(&p->el_pending, &p->num_el_pending);
             continue;
         }
@@ -152,6 +168,8 @@ static void pair_process(struct mp_filter *f)
             } else {
                 bl->enhancement_layer = el;
             }
+            p->paired++;
+            set_pair_diagnostics(p, bl, true);
             mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, bl));
             continue;
         }
@@ -166,6 +184,8 @@ static void pair_process(struct mp_filter *f)
 
         take_head(&p->bl_pending, &p->num_bl_pending);
         bl->enhancement_layer = NULL;
+        p->missed++;
+        set_pair_diagnostics(p, bl, false);
         mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, bl));
     }
 }

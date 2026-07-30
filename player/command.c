@@ -2128,12 +2128,19 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
                         .unavailable = !p.decoder},
         {"decoder-desc", SUB_PROP_STR(p.decoder_desc),
                         .unavailable = !p.decoder_desc},
+        {"audio-pipeline", SUB_PROP_STR(p.audio_pipeline),
+                        .unavailable = !p.audio_pipeline},
         {"codec",       SUB_PROP_STR(p.codec),
                         .unavailable = !p.codec},
         {"codec-desc",  SUB_PROP_STR(p.codec_desc),
                         .unavailable = !p.codec_desc},
         {"codec-profile", SUB_PROP_STR(p.codec_profile),
                         .unavailable = !p.codec_profile},
+        {"codec-level", SUB_PROP_INT(p.lav_codecpar ? p.lav_codecpar->level : 0),
+                        .unavailable = !p.lav_codecpar ||
+                                       p.lav_codecpar->level == AV_LEVEL_UNKNOWN},
+        {"bits-per-sample", SUB_PROP_INT(p.bits_per_coded_sample),
+                        .unavailable = p.bits_per_coded_sample <= 0},
         {"demux-w",     SUB_PROP_INT(p.disp_w), .unavailable = !p.disp_w},
         {"demux-h",     SUB_PROP_INT(p.disp_h), .unavailable = !p.disp_h},
         {"demux-crop-x",SUB_PROP_INT(p.crop.x0), .unavailable = !has_crop},
@@ -2163,6 +2170,8 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
         {"dolby-vision-profile", SUB_PROP_INT(p.dv_profile),
                         .unavailable = !p.dovi},
         {"dolby-vision-level", SUB_PROP_INT(p.dv_level),
+                        .unavailable = !p.dovi},
+        {"dolby-vision-enhancement-layer", SUB_PROP_BOOL(p.dv_el_present),
                         .unavailable = !p.dovi},
         {"metadata", SUB_PROP_KEYVALUE_LIST(tag_list),
                         .unavailable = !tags->num_keys},
@@ -2717,6 +2726,24 @@ static int mp_property_video_frame_info(void *ctx, struct m_property *prop,
     const char *pict_types[] = {0, "I", "P", "B"};
     const char *pict_type = f->pict_type >= 1 && f->pict_type <= 3
                           ? pict_types[f->pict_type] : NULL;
+    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    struct mp_codec_params *codec =
+        track && track->stream ? track->stream->codec : NULL;
+    bool dovi = (codec && codec->dovi) || f->dovi;
+    bool has_el = codec && codec->dv_el_present;
+    const char *dovi_mode = !has_el ? "single-layer" :
+                           f->dovi_residual_mode == 2 ? "FEL" :
+                           f->dovi_residual_mode == 1 ? "MEL" : "EL";
+    const char *composition = !has_el ? "single-layer" :
+                             f->dovi_el_paired ? "active" :
+                             "base-layer fallback";
+    const char *el_format = NULL;
+    if (f->enhancement_layer) {
+        int fmt = f->enhancement_layer->params.hw_subfmt
+                ? f->enhancement_layer->params.hw_subfmt
+                : f->enhancement_layer->imgfmt;
+        el_format = mp_imgfmt_to_name(fmt);
+    }
 
     char gop_tc[AV_TIMECODE_STR_SIZE] = {0};
     char s12m_tc[AV_TIMECODE_STR_SIZE] = {0};
@@ -2754,6 +2781,23 @@ static int mp_property_video_frame_info(void *ctx, struct m_property *prop,
         {"interlaced",      SUB_PROP_BOOL(!!(f->fields & MP_IMGFIELD_INTERLACED))},
         {"tff",             SUB_PROP_BOOL(!!(f->fields & MP_IMGFIELD_TOP_FIRST))},
         {"repeat",          SUB_PROP_BOOL(!!(f->fields & MP_IMGFIELD_REPEAT_FIRST))},
+        {"dolby-vision-rpu", SUB_PROP_BOOL(!!f->dovi), .unavailable = !dovi},
+        {"dolby-vision-mode", SUB_PROP_STR(dovi_mode), .unavailable = !dovi},
+        {"dolby-vision-composition", SUB_PROP_STR(composition), .unavailable = !dovi},
+        {"dolby-vision-el-paired", SUB_PROP_BOOL(f->dovi_el_paired),
+                                  .unavailable = !has_el},
+        {"dolby-vision-el-format", SUB_PROP_STR(el_format),
+                                  .unavailable = !el_format},
+        {"dolby-vision-el-pairs", SUB_PROP_INT64(f->dovi_el_pairs),
+                                 .unavailable = !has_el},
+        {"dolby-vision-el-misses", SUB_PROP_INT64(f->dovi_el_misses),
+                                  .unavailable = !has_el},
+        {"dolby-vision-el-late", SUB_PROP_INT64(f->dovi_el_late),
+                                .unavailable = !has_el},
+        {"dolby-vision-bl-queue", SUB_PROP_INT(f->dovi_bl_queue),
+                                 .unavailable = !has_el},
+        {"dolby-vision-el-queue", SUB_PROP_INT(f->dovi_el_queue),
+                                 .unavailable = !has_el},
         {"gop-timecode",    SUB_PROP_STR(gop_tc), .unavailable = gop_tc[0] == '\0'},
         {"smpte-timecode",  SUB_PROP_STR(s12m_tc), .unavailable = s12m_tc[0] == '\0'},
         {"estimated-smpte-timecode", SUB_PROP_STR(approx_smpte), .unavailable = approx_smpte[0] == '\0'},

@@ -131,6 +131,14 @@ typedef struct mp_image {
     int num_ff_side_data;
     // Optional decoded enhancement-layer frame
     struct mp_image *enhancement_layer;
+    // Live Dolby Vision diagnostics copied with the displayed frame.
+    uint8_t dovi_residual_mode; // 0=unknown, 1=MEL/no residual, 2=FEL/residual
+    bool dovi_el_paired;
+    uint64_t dovi_el_pairs;
+    uint64_t dovi_el_misses;
+    uint64_t dovi_el_late;
+    uint8_t dovi_bl_queue;
+    uint8_t dovi_el_queue;
 } mp_image_t;
 
 struct mp_ff_side_data {
