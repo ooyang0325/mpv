@@ -18,5 +18,6 @@ int mp_dop_output_frames(const struct mp_dop_state *state, size_t src_size,
 int mp_dop_pack(struct mp_dop_state *state, uint32_t *dst,
                 const uint8_t *src, size_t src_size, int channels,
                 bool planar, bool lsb_first);
+float mp_dop_word_to_float(uint32_t word);
 
 #endif

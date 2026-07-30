@@ -44,6 +44,7 @@
 
 #include "ao.h"
 #include "internal.h"
+#include "audio/dop.h"
 #include "audio/format.h"
 #include "osdep/timer.h"
 #include "options/m_option.h"
@@ -79,6 +80,8 @@ struct priv {
     AudioStreamBasicDescription original_virtual_asbd;
     bool changed_virtual_format;
     bool dop_high_aligned;
+    bool dop_float_hack;
+    bool dop_fa_marker;
 
     // Output s16 physical format, float32 virtual format, ac3/dts mpv format
     bool spdif_hack;
@@ -166,6 +169,32 @@ static void bad_hack_mygodwhy(char *data, int samples)
     }
 }
 
+static void dop_hack_mygodwhy(char *data, int frames, int read_frames,
+                              int channels, bool as_float, bool high_aligned,
+                              bool *fa_marker)
+{
+    for (int frame = 0; frame < frames; frame++) {
+        uint32_t marker = *fa_marker ? 0xfa : 0x05;
+        for (int channel = 0; channel < channels; channel++) {
+            int index = frame * channels + channel;
+            uint32_t word = frame < read_frames ? AV_RN32(data + index * 4)
+                                                : 0x6969;
+            word = (word & 0xffff) | marker << 16;
+
+            if (as_float) {
+                AV_WN32(data + index * 4,
+                        av_float2int(mp_dop_word_to_float(word)));
+            } else if (high_aligned) {
+                AV_WN32(data + index * 4, word << 8);
+            } else {
+                AV_WN32(data + index * 4,
+                        word | (word & 0x800000 ? 0xff000000 : 0));
+            }
+        }
+        *fa_marker = !*fa_marker;
+    }
+}
+
 static OSStatus render_cb_compressed(
         AudioDeviceID device, const AudioTimeStamp *ts,
         const void *in_data, const AudioTimeStamp *in_ts,
@@ -189,13 +218,13 @@ static OSStatus render_cb_compressed(
     end += p->hw_latency_ns + ca_get_latency(ts)
         + ca_frames_to_ns(ao, pseudo_frames);
 
-    ao_read_data(ao, &buf.mData, pseudo_frames, end, NULL, true, true);
+    int read_frames =
+        ao_read_data(ao, &buf.mData, pseudo_frames, end, NULL, true, true);
 
-    if (ao->format == AF_FORMAT_S_DOP && p->dop_high_aligned) {
-        uint32_t *samples = buf.mData;
-        for (int n = 0; n < pseudo_frames * ao->channels.num; n++)
-            samples[n] <<= 8;
-    }
+    if (ao->format == AF_FORMAT_S_DOP)
+        dop_hack_mygodwhy(buf.mData, pseudo_frames, read_frames,
+                          ao->channels.num, p->dop_float_hack,
+                          p->dop_high_aligned, &p->dop_fa_marker);
 
     if (p->spdif_hack)
         bad_hack_mygodwhy(buf.mData, pseudo_frames * ao->channels.num);
@@ -253,8 +282,8 @@ coreaudio_error:
     return -1;
 }
 
-static bool dop_asbd_is_supported(const AudioStreamBasicDescription *asbd,
-                                  int samplerate, int channels)
+static bool dop_physical_asbd_is_supported(
+    const AudioStreamBasicDescription *asbd, int samplerate, int channels)
 {
     uint32_t flags = asbd->mFormatFlags;
     return asbd->mFormatID == kAudioFormatLinearPCM &&
@@ -266,6 +295,23 @@ static bool dop_asbd_is_supported(const AudioStreamBasicDescription *asbd,
            (flags & kAudioFormatFlagIsSignedInteger) &&
            !(flags & (kAudioFormatFlagIsFloat |
                       kAudioFormatFlagIsBigEndian |
+                      kAudioFormatFlagIsNonInterleaved));
+}
+
+static bool dop_virtual_asbd_is_supported(
+    const AudioStreamBasicDescription *asbd, int samplerate, int channels)
+{
+    uint32_t flags = asbd->mFormatFlags;
+    bool sample_format =
+        ((flags & kAudioFormatFlagIsFloat) && asbd->mBitsPerChannel == 32) ||
+        ((flags & kAudioFormatFlagIsSignedInteger) &&
+         (asbd->mBitsPerChannel == 24 || asbd->mBitsPerChannel == 32));
+    return asbd->mFormatID == kAudioFormatLinearPCM &&
+           fabs(asbd->mSampleRate - samplerate) < 1.0 &&
+           asbd->mChannelsPerFrame == channels &&
+           asbd->mBytesPerFrame == 4 * channels &&
+           asbd->mFramesPerPacket == 1 && sample_format &&
+           !(flags & (kAudioFormatFlagIsBigEndian |
                       kAudioFormatFlagIsNonInterleaved));
 }
 
@@ -297,8 +343,8 @@ static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
             if (asbd.mSampleRate >= range.mMinimum &&
                 asbd.mSampleRate <= range.mMaximum)
                 stream_asbd->mSampleRate = asbd.mSampleRate;
-            if (!dop_asbd_is_supported(stream_asbd, ao->samplerate,
-                                       ao->channels.num))
+            if (!dop_physical_asbd_is_supported(stream_asbd, ao->samplerate,
+                                                ao->channels.num))
                 continue;
         }
 
@@ -392,16 +438,30 @@ static int init(struct ao *ao)
                  &p->original_virtual_asbd);
     CHECK_CA_ERROR("could not get stream's original virtual format");
 
-    // Even if changing the physical format fails, we can try using the current
-    // virtual format.
-    ca_change_physical_format_sync(ao, p->stream, hwfmt);
+    bool changed_physical = ca_change_physical_format_sync(ao, p->stream, hwfmt);
+    if (original_format == AF_FORMAT_S_DOP && !changed_physical)
+        goto coreaudio_error;
 
-    if (original_format == AF_FORMAT_S_DOP &&
-        !ca_asbd_equals(&p->original_virtual_asbd, &hwfmt))
-    {
-        err = CA_SET(p->stream, kAudioStreamPropertyVirtualFormat, &hwfmt);
-        CHECK_CA_ERROR("could not set DoP virtual format");
-        p->changed_virtual_format = true;
+    if (original_format == AF_FORMAT_S_DOP) {
+        AudioStreamBasicDescription physical = {0};
+        err = CA_GET(p->stream, kAudioStreamPropertyPhysicalFormat, &physical);
+        CHECK_CA_ERROR("could not get DoP physical format");
+        if (!dop_physical_asbd_is_supported(&physical, ao->samplerate,
+                                            ao->channels.num))
+        {
+            MP_ERR(ao, "Device has no exact integer PCM carrier for DoP.\n");
+            goto coreaudio_error;
+        }
+
+        AudioStreamBasicDescription virtual = {0};
+        err = CA_GET(p->stream, kAudioStreamPropertyVirtualFormat, &virtual);
+        CHECK_CA_ERROR("could not get DoP virtual format");
+        if (fabs(virtual.mSampleRate - ao->samplerate) >= 1.0) {
+            virtual.mSampleRate = ao->samplerate;
+            err = CA_SET(p->stream, kAudioStreamPropertyVirtualFormat, &virtual);
+            CHECK_CA_ERROR("could not set DoP virtual sample rate");
+            p->changed_virtual_format = true;
+        }
     }
 
     if (!ca_init_chmap(ao, p->device))
@@ -419,15 +479,18 @@ static int init(struct ao *ao)
     }
 
     if (original_format == AF_FORMAT_S_DOP) {
-        if (!dop_asbd_is_supported(&p->stream_asbd, ao->samplerate,
-                                   ao->channels.num))
+        if (!dop_virtual_asbd_is_supported(&p->stream_asbd, ao->samplerate,
+                                           ao->channels.num))
         {
-            MP_ERR(ao, "Device has no exact integer PCM carrier for DoP.\n");
+            MP_ERR(ao, "Device has no usable virtual PCM carrier for DoP.\n");
             goto coreaudio_error;
         }
+        p->dop_float_hack =
+            p->stream_asbd.mFormatFlags & kAudioFormatFlagIsFloat;
         p->dop_high_aligned =
-            p->stream_asbd.mBitsPerChannel == 32 ||
-            (p->stream_asbd.mFormatFlags & kAudioFormatFlagIsAlignedHigh);
+            !p->dop_float_hack &&
+            (p->stream_asbd.mBitsPerChannel == 32 ||
+             (p->stream_asbd.mFormatFlags & kAudioFormatFlagIsAlignedHigh));
         ao->format = AF_FORMAT_S_DOP;
     } else {
         int new_format = ca_asbd_to_mp_format(&p->stream_asbd);
@@ -521,6 +584,7 @@ static void audio_pause(struct ao *ao)
 
     OSStatus err = AudioDeviceStop(p->device, p->render_cb);
     CHECK_CA_WARN("can't stop audio device");
+    p->dop_fa_marker = false;
 }
 
 static void audio_resume(struct ao *ao)

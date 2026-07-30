@@ -66,3 +66,11 @@ int mp_dop_pack(struct mp_dop_state *state, uint32_t *dst,
 
     return frames == expected ? frames : -1;
 }
+
+float mp_dop_word_to_float(uint32_t word)
+{
+    int32_t sample = word & 0xffffff;
+    if (sample & 0x800000)
+        sample -= 0x1000000;
+    return sample / 8388608.0f;
+}

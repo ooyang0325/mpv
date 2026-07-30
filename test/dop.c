@@ -1,4 +1,5 @@
 #include <string.h>
+#include <math.h>
 
 #include "audio/dop.h"
 #include "audio/format.h"
@@ -59,6 +60,16 @@ static void test_split_packets(void)
     assert_int_equal(mp_dop_output_frames(&state, 3, 2), -1);
 }
 
+static void test_float_carrier(void)
+{
+    const uint32_t words[] = {0x00051256, 0x00fa9ade};
+    for (int n = 0; n < MP_ARRAY_SIZE(words); n++) {
+        double scaled = mp_dop_word_to_float(words[n]) * 2147483648.0;
+        int32_t physical = llrint(scaled);
+        assert_int_equal((uint32_t)physical, words[n] << 8);
+    }
+}
+
 int main(void)
 {
     assert_int_equal(af_fmt_to_bytes(AF_FORMAT_S_DOP), 4);
@@ -69,5 +80,6 @@ int main(void)
     test_layout(false, true);
     test_layout(true, true);
     test_split_packets();
+    test_float_carrier();
     return 0;
 }

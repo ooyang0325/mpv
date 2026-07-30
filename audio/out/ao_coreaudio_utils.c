@@ -151,12 +151,13 @@ static void ca_fill_asbd_raw(AudioStreamBasicDescription *asbd, int mp_format,
         *asbd = (AudioStreamBasicDescription){
             .mSampleRate       = samplerate,
             .mFormatID         = kAudioFormatLinearPCM,
-            .mFormatFlags      = kAudioFormatFlagIsSignedInteger,
+            .mFormatFlags      = kAudioFormatFlagIsSignedInteger |
+                                 kAudioFormatFlagIsPacked,
             .mBytesPerPacket   = 4 * num_channels,
             .mFramesPerPacket  = 1,
             .mBytesPerFrame    = 4 * num_channels,
             .mChannelsPerFrame = num_channels,
-            .mBitsPerChannel   = 24,
+            .mBitsPerChannel   = 32,
         };
         return;
     }
