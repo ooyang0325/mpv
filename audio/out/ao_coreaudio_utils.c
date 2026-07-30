@@ -265,6 +265,44 @@ static bool value_is_better(double req, double old, double new)
     }
 }
 
+// Sample rates are doubles reported by the hardware, and no two standard rates are within
+// 1 Hz of each other, so compare them with a tolerance rather than exactly.
+static bool rate_equals(double a, double b)
+{
+    return fabs(a - b) < 1.0;
+}
+
+// Whether one rate is a whole multiple of the other, so converting between them is a plain
+// decimation or interpolation rather than an arbitrary ratio.
+static bool rate_is_integer_ratio(double a, double b)
+{
+    if (a <= 0 || b <= 0)
+        return false;
+    double lo = MPMIN(a, b), hi = MPMAX(a, b);
+    return rate_equals(lrint(hi / lo) * lo, hi);
+}
+
+// Return whether new is a better sample rate than old for the requested one.
+//
+// Running the device at the source's own rate is always best. Failing that, prefer a rate that
+// is in a whole-number ratio with the source, in either direction, because that is a clean
+// decimation or interpolation: 384 kHz through a 96 kHz device is a quarter, 44.1 kHz through a
+// 176.4 kHz device is a quadruple. A source whose rate has no such relation to anything the
+// device offers falls back to the highest rate available, which leaves the resampler the most
+// room to work in.
+static bool rate_is_better(double req, double old, double new)
+{
+    if (rate_equals(new, req) || rate_equals(old, req))
+        return rate_equals(new, req);
+
+    bool old_ratio = rate_is_integer_ratio(req, old);
+    bool new_ratio = rate_is_integer_ratio(req, new);
+    if (old_ratio != new_ratio)
+        return new_ratio;
+
+    return new >= old;
+}
+
 // Return whether new is an improvement over old (req is the requested format).
 bool ca_asbd_is_better(AudioStreamBasicDescription *req,
                        AudioStreamBasicDescription *old,
@@ -283,8 +321,15 @@ bool ca_asbd_is_better(AudioStreamBasicDescription *req,
                          new->mBitsPerChannel))
         return false;
 
-    if (!value_is_better(req->mSampleRate, old->mSampleRate, new->mSampleRate))
+    // A compressed stream has to be carried at exactly the rate it was encoded at or the
+    // receiver cannot decode it, so only linear PCM gets the ratio-aware rule.
+    if (req->mFormatID == kAudioFormatLinearPCM) {
+        if (!rate_is_better(req->mSampleRate, old->mSampleRate, new->mSampleRate))
+            return false;
+    } else if (!value_is_better(req->mSampleRate, old->mSampleRate,
+                                new->mSampleRate)) {
         return false;
+    }
 
     if (!value_is_better(req->mChannelsPerFrame, old->mChannelsPerFrame,
                          new->mChannelsPerFrame))
