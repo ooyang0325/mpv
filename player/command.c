@@ -3072,7 +3072,9 @@ static int mp_property_vo_passes(void *ctx, struct m_property *prop,
         return M_PROPERTY_NOT_IMPLEMENTED;
     }
 
-    struct voctrl_performance_data *data = talloc_ptrtype(NULL, data);
+    // Zeroed: a VO that reports success without filling this in must not make
+    // us walk a garbage pass count.
+    struct voctrl_performance_data *data = talloc_zero_ptrtype(NULL, data);
     if (vo_control(mpctx->video_out, VOCTRL_PERFORMANCE_DATA, data) <= 0) {
         talloc_free(data);
         return M_PROPERTY_UNAVAILABLE;

@@ -337,16 +337,8 @@ static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
     return NULL;
 }
 
-/*
- * @brief Collects performance data from the render_backend.
- * @param ctx The render_backend context.
- * @param out The output structure to fill with performance data.
- */
-static void perfdata(struct render_backend *ctx,
-                     struct voctrl_performance_data *out)
-{
-}
-
+// No perfdata callback: this backend collects no pass timings, and a stub that
+// left voctrl_performance_data untouched would report success with garbage.
 const struct render_backend_fns render_backend_gpu_next = {
     .init = init,
     .destroy = destroy,
@@ -360,5 +352,4 @@ const struct render_backend_fns render_backend_gpu_next = {
     .get_target_size = get_target_size,
     .get_image = get_image,
     .screenshot = screenshot,
-    .perfdata = perfdata,
 };
