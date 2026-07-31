@@ -1,0 +1,48 @@
+name: IINA regressions
+
+on:
+  push:
+    branches: [iina-dv-atmos]
+  pull_request:
+    branches: [iina-dv-atmos]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew untap aws/tap 2>/dev/null || true
+          brew install --quiet meson ninja pkg-config nasm ffmpeg libass libplacebo \
+            luajit uchardet libarchive libbluray libsoxr rubberband
+
+      - name: Build
+        run: |
+          meson setup build --buildtype=release \
+            -Dtests=true -Dlibmpv=true -Dcplayer=false \
+            -Dorender=enabled -Dsacd=disabled
+          meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: meson-logs
+          path: build/meson-logs/
