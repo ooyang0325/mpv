@@ -249,6 +249,19 @@ static void init_physical_format(struct ao *ao)
 
             ca_print_asbd(ao, "- ", stream_asbd);
 
+            // This driver shares the device with the rest of the system: init()
+            // redirects to coreaudio_exclusive whenever exclusive access is asked for.
+            // Devices commonly advertise each format twice, once mixable and once not,
+            // and the two differ only by this flag, so the plain "is it better" rules
+            // pick whichever comes last. Landing on the non-mixable one leaves the
+            // system mixer unable to feed the stream, which is heard as bursts of
+            // noise, and leaves every other application in the same state until the
+            // format is put back.
+            if (stream_asbd->mFormatFlags & kAudioFormatFlagIsNonMixable) {
+                MP_VERBOSE(ao, "  (skipped: non-mixable)\n");
+                continue;
+            }
+
             if (!best_asbd.mFormatID || ca_asbd_is_better(&asbd, &best_asbd,
                                                           stream_asbd))
                 best_asbd = *stream_asbd;

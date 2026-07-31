@@ -395,7 +395,13 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
     }
 
     // Format change during syncing. Force playback start early, then wait.
-    if (ao_c->ao_queue && mp_async_queue_get_frames(ao_c->ao_queue) &&
+    // Both of these deliberately leave the existing output alone, so they must not be
+    // taken when there is no output to leave alone: reload_audio_output() destroys the AO
+    // and relies on this function to build the replacement, and audio_start_ao() only runs
+    // once one exists. Returning here without an AO leaves the two waiting on each other,
+    // with playback stopped and only a seek able to break the deadlock.
+    if (mpctx->ao && ao_c->ao_queue &&
+        mp_async_queue_get_frames(ao_c->ao_queue) &&
         mpctx->audio_status == STATUS_SYNCING)
     {
         mpctx->audio_status = STATUS_READY;
@@ -403,7 +409,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
         talloc_free(out_fmt);
         return 0;
     }
-    if (mpctx->audio_status == STATUS_READY) {
+    if (mpctx->ao && mpctx->audio_status == STATUS_READY) {
         talloc_free(out_fmt);
         return 0;
     }

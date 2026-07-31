@@ -76,6 +76,10 @@ struct priv {
 
     // format we changed the stream to, and the original format to restore
     AudioStreamBasicDescription stream_asbd;
+    // The physical format this output installed. macOS re-derives the virtual format from
+    // it asynchronously, so the virtual format is not a reliable signal of the device
+    // having been taken away from us.
+    AudioStreamBasicDescription physical_asbd;
     AudioStreamBasicDescription original_asbd;
     AudioStreamBasicDescription original_virtual_asbd;
     bool changed_virtual_format;
@@ -101,11 +105,17 @@ static OSStatus property_listener_cb(
     struct ao *ao = data;
     struct priv *p = ao->priv;
 
-    // Check whether we need to reset the compressed output stream.
+    // Check whether the device was taken away from us. Compare the physical format, which
+    // is the one this output installed: setting a non-mixable physical format makes macOS
+    // re-derive the virtual format a moment later, so watching the virtual format sees our
+    // own change arrive as if it were somebody else's and reloads the output. The reload
+    // installs the format again, which fires this callback again, and playback never
+    // starts. Nothing but a seek breaks the cycle, which is what made it look like the
+    // play button had stopped working after switching outputs.
     AudioStreamBasicDescription f;
-    OSErr err = CA_GET(p->stream, kAudioStreamPropertyVirtualFormat, &f);
+    OSErr err = CA_GET(p->stream, kAudioStreamPropertyPhysicalFormat, &f);
     CHECK_CA_WARN("could not get stream format");
-    if (err != noErr || !ca_asbd_equals(&p->stream_asbd, &f)) {
+    if (err != noErr || !ca_asbd_equals(&p->physical_asbd, &f)) {
         if (atomic_compare_exchange_strong(&p->reload_requested,
                                            &(bool){false}, true))
         {
@@ -533,6 +543,11 @@ static int init(struct ao *ao)
 
     p->hw_latency_ns = ca_get_device_latency_ns(ao, p->device);
     MP_VERBOSE(ao, "base latency: %lld nanoseconds\n", p->hw_latency_ns);
+
+    // Read the physical format back as late as possible, so the listener below compares
+    // against the format the device actually settled on rather than the one we asked for.
+    err = CA_GET(p->stream, kAudioStreamPropertyPhysicalFormat, &p->physical_asbd);
+    CHECK_CA_ERROR("could not get the installed physical format");
 
     err = enable_property_listener(ao, true);
     CHECK_CA_ERROR("cannot install format change listener during init");
