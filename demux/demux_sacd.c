@@ -29,34 +29,33 @@ struct priv {
     iina_sacd *sacd;
     struct sh_stream *stream;
     iina_sacd_area_info area;
+    uint8_t frame[SACD_MAX_FRAME_SIZE];
 };
 
 static bool read_packet(struct demuxer *demuxer, struct demux_packet **out)
 {
     struct priv *p = demuxer->priv;
-    struct demux_packet *packet =
-        new_demux_packet(demuxer->packet_pool, SACD_MAX_FRAME_SIZE);
-    if (!packet)
-        return true;
-
     size_t size = 0;
     int dst = 0;
     double pts = 0;
-    int result = iina_sacd_read_frame(p->sacd, packet->buffer, packet->len,
+    int result = iina_sacd_read_frame(p->sacd, p->frame, sizeof(p->frame),
                                       &size, &dst, &pts);
     if (result <= 0) {
-        talloc_free(packet);
         if (result < 0)
             MP_ERR(demuxer, "Invalid SACD audio frame.\n");
         return false;
     }
     if (!!dst != !!p->area.dst_encoded) {
         MP_ERR(demuxer, "SACD area changed encoding unexpectedly.\n");
-        talloc_free(packet);
         return false;
     }
 
-    demux_packet_shorten(packet, size);
+    struct demux_packet *packet =
+        new_demux_packet(demuxer->packet_pool, size);
+    if (!packet)
+        return true;
+    memcpy(packet->buffer, p->frame, size);
+
     packet->stream = p->stream->index;
     packet->pts = packet->dts = pts;
     packet->duration = 1.0 / SACD_FRAME_RATE;
