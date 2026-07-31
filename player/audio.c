@@ -481,6 +481,13 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
                 goto init_error;
             reset_audio_state(mpctx);
             mp_output_chain_reset_harder(ao_c->filter);
+            // The passthrough decoder may already have consumed packets before the AO
+            // rejected its carrier. Reinitializing it changes the output format to PCM,
+            // but cannot recreate those packets, so the chain waits forever with no
+            // frame to trigger the new AO. A refresh seek is the missing half of the
+            // fallback; it is the same action that made playback recover when the user
+            // dragged the timeline.
+            issue_refresh_seek(mpctx, MPSEEK_EXACT);
             mp_wakeup_core(mpctx); // reinit with new format next time
             return 0;
         }
