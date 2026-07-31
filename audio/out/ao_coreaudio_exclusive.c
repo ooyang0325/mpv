@@ -82,6 +82,7 @@ struct priv {
     AudioStreamBasicDescription physical_asbd;
     AudioStreamBasicDescription original_asbd;
     AudioStreamBasicDescription original_virtual_asbd;
+    bool original_asbd_sanitized;
     bool changed_virtual_format;
     bool dop_high_aligned;
     bool dop_float_hack;
@@ -91,6 +92,7 @@ struct priv {
     bool spdif_hack;
 
     bool changed_mixing;
+    bool restore_default_device;
 
     atomic_bool reload_requested;
 
@@ -376,6 +378,54 @@ coreaudio_error:
     return -1;
 }
 
+// If a previous crash or failed teardown stranded a USB DAC in a non-mixable
+// format, recording that as the "original" would restore the broken state forever.
+// Prefer the identical mixable variant the device advertises at the same rate.
+static void sanitize_original_format(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!(p->original_asbd.mFormatFlags & kAudioFormatFlagIsNonMixable))
+        return;
+
+    AudioStreamRangedDescription *formats = NULL;
+    size_t count = 0;
+    if (CA_GET_ARY(p->stream, kAudioStreamPropertyAvailablePhysicalFormats,
+                   &formats, &count) != noErr)
+        return;
+
+    uint32_t ignored = kAudioFormatFlagIsNonMixable;
+    for (int n = 0; n < count; n++) {
+        AudioStreamBasicDescription candidate = formats[n].mFormat;
+        if (candidate.mFormatFlags & kAudioFormatFlagIsNonMixable)
+            continue;
+        if (fabs(candidate.mSampleRate - p->original_asbd.mSampleRate) < 1.0 &&
+            candidate.mFormatID == p->original_asbd.mFormatID &&
+            (candidate.mFormatFlags & ~ignored) ==
+                (p->original_asbd.mFormatFlags & ~ignored) &&
+            candidate.mBitsPerChannel == p->original_asbd.mBitsPerChannel &&
+            candidate.mBytesPerFrame == p->original_asbd.mBytesPerFrame &&
+            candidate.mChannelsPerFrame == p->original_asbd.mChannelsPerFrame)
+        {
+            MP_WARN(ao, "Original device format was non-mixable; restoring its mixable counterpart.\n");
+            p->original_asbd = candidate;
+            p->original_asbd_sanitized = true;
+            break;
+        }
+    }
+    talloc_free(formats);
+}
+
+static void restore_default_device(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->restore_default_device)
+        return;
+    OSStatus err = CA_SET(kAudioObjectSystemObject,
+                          kAudioHardwarePropertyDefaultOutputDevice, &p->device);
+    CHECK_CA_WARN("could not restore the default output device");
+    p->restore_default_device = false;
+}
+
 static void restore_stream_formats(struct ao *ao)
 {
     struct priv *p = ao->priv;
@@ -386,7 +436,7 @@ static void restore_stream_formats(struct ao *ao)
         MP_WARN(ao, "can't revert to original device format\n");
     p->original_asbd = (AudioStreamBasicDescription){0};
 
-    if (p->changed_virtual_format) {
+    if (p->changed_virtual_format && !p->original_asbd_sanitized) {
         OSStatus err = CA_SET(p->stream, kAudioStreamPropertyVirtualFormat,
                               &p->original_virtual_asbd);
         CHECK_CA_WARN("can't revert to original virtual format");
@@ -427,6 +477,14 @@ static int init(struct ao *ao)
 
     if (!is_alive)
         MP_WARN(ao, "device is not alive\n");
+
+    // Hogging a default USB DAC makes macOS move the system default elsewhere. Remember
+    // whether this was the default before taking it so auto-selection still means the same
+    // device after exclusive mode is turned off or the app quits.
+    AudioDeviceID default_device = kAudioObjectUnknown;
+    if (CA_GET(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice,
+               &default_device) == noErr)
+        p->restore_default_device = default_device == p->device;
 
     // Take the device. A previous output of our own on the way out can still hold it for
     // a moment, so do not give up on the first refusal; this is the common case when the
@@ -470,6 +528,7 @@ static int init(struct ao *ao)
     err = CA_GET(p->stream, kAudioStreamPropertyVirtualFormat,
                  &p->original_virtual_asbd);
     CHECK_CA_ERROR("could not get stream's original virtual format");
+    sanitize_original_format(ao);
 
     bool changed_physical = ca_change_physical_format_sync(ao, p->stream, hwfmt);
     // Exclusive output only means anything if the stream really is running the format it
@@ -595,6 +654,7 @@ coreaudio_error:
     restore_stream_formats(ao);
     err = ca_unlock_device(p->device, &p->hog_pid);
     CHECK_CA_WARN("can't release hog mode");
+    restore_default_device(ao);
 coreaudio_error_nounlock:
     return CONTROL_ERROR;
 }
@@ -620,6 +680,7 @@ static void uninit(struct ao *ao)
 
     err = ca_unlock_device(p->device, &p->hog_pid);
     CHECK_CA_WARN("can't release hog mode");
+    restore_default_device(ao);
 }
 
 static void audio_pause(struct ao *ao)
