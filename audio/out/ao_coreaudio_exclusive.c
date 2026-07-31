@@ -428,8 +428,31 @@ static int init(struct ao *ao)
     if (!is_alive)
         MP_WARN(ao, "device is not alive\n");
 
-    err = ca_lock_device(p->device, &p->hog_pid);
+    // Take the device. A previous output of our own on the way out can still hold it for
+    // a moment, so do not give up on the first refusal; this is the common case when the
+    // user turns exclusive mode on while something is already playing.
+    for (int attempt = 0; attempt < 20; attempt++) {
+        err = ca_lock_device(p->device, &p->hog_pid);
+        if (err == noErr)
+            break;
+        mp_sleep_ns(MP_TIME_MS_TO_NS(25));
+    }
     CHECK_CA_WARN("failed to set hogmode");
+    // Exclusive output exists to own the device outright. Carrying on without it means
+    // reprogramming the stream will be refused, which is only a warning further down, so
+    // the output would run believing it had installed a format it never got: the samples
+    // are then interpreted at the wrong width or rate and come out as bursts of noise.
+    // Refusing here instead keeps the device in a state that still plays correctly.
+    if (err != noErr) {
+        // Keep playing rather than going silent: give the device up, drop the exclusive
+        // request and hand back to the shared output, which does not need to own the
+        // device. The next time the output is rebuilt the request is made again, so a
+        // moment of contention does not cost exclusive mode for the whole session.
+        MP_WARN(ao, "Device is owned by another process, using shared output.\n");
+        ao->init_flags &= ~AO_INIT_EXCLUSIVE;
+        ao->redirect = "coreaudio";
+        goto coreaudio_error;
+    }
 
     err = ca_disable_mixing(ao, p->device, &p->changed_mixing);
     CHECK_CA_WARN("failed to disable mixing");
@@ -449,8 +472,14 @@ static int init(struct ao *ao)
     CHECK_CA_ERROR("could not get stream's original virtual format");
 
     bool changed_physical = ca_change_physical_format_sync(ao, p->stream, hwfmt);
-    if (original_format == AF_FORMAT_S_DOP && !changed_physical)
+    // Exclusive output only means anything if the stream really is running the format it
+    // asked for. Continuing after a refusal leaves the device on whatever it had, while
+    // the samples handed to it are built for the format that was requested, which is
+    // heard as bursts of noise. Fail instead and let mpv fall back to shared output.
+    if (!changed_physical) {
+        MP_ERR(ao, "Could not install the requested device format.\n");
         goto coreaudio_error;
+    }
 
     if (original_format == AF_FORMAT_S_DOP) {
         AudioStreamBasicDescription physical = {0};

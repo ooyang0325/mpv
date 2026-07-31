@@ -236,9 +236,14 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
             char redirect[80], rdevice[80];
             snprintf(redirect, sizeof(redirect), "%s", ao->redirect);
             snprintf(rdevice, sizeof(rdevice), "%s", ao->device ? ao->device : "");
+            // Carry the flags the driver leaves behind rather than the ones it was given,
+            // so a driver that cannot honour one can drop it and redirect instead of
+            // failing outright. Without this a redirect back to a driver that only
+            // rejects the flag again would loop.
+            int rflags = ao->init_flags;
             ao_uninit(ao);
             return ao_init(probing, global, wakeup_cb, wakeup_ctx,
-                           encode_lavc_ctx, flags, samplerate, format, channels,
+                           encode_lavc_ctx, rflags, samplerate, format, channels,
                            rdevice, redirect);
         }
         goto fail;

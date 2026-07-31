@@ -428,7 +428,12 @@ OSStatus ca_unlock_device(AudioDeviceID device, pid_t *pid)
 {
     if (*pid == getpid()) {
         *pid = -1;
-        return CA_SET(device, kAudioDevicePropertyHogMode, &pid);
+        // Pass the pid itself, not the address of the parameter: taking &pid here hands
+        // Core Audio the low bytes of a stack address as the new owner, so the device is
+        // left hogged by a process that does not exist. Nothing can reprogram its format
+        // after that, exclusive output silently runs on the wrong one, and every other
+        // application is locked out until the device is unplugged.
+        return CA_SET(device, kAudioDevicePropertyHogMode, pid);
     }
     return noErr;
 }
