@@ -36,6 +36,7 @@
 
 #include <stdatomic.h>
 #include <math.h>
+#include <string.h>
 
 #include <CoreAudio/HostTime.h>
 
@@ -93,11 +94,29 @@ struct priv {
 
     bool changed_mixing;
     bool restore_default_device;
+    bool needs_warmup;
+    bool changed_volume;
+    float original_volume;
 
     atomic_bool reload_requested;
+    atomic_bool warming_up;
 
     uint64_t hw_latency_ns;
 };
+
+static int get_volume(struct ao *ao, float *vol);
+static int set_volume(struct ao *ao, float *vol);
+static int get_mute(struct ao *ao, bool *muted);
+static int set_mute(struct ao *ao, bool *muted);
+
+static void restore_dop_volume(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (p->changed_volume) {
+        set_volume(ao, &p->original_volume);
+        p->changed_volume = false;
+    }
+}
 
 static OSStatus property_listener_cb(
     AudioObjectID object, uint32_t n_addresses,
@@ -230,8 +249,14 @@ static OSStatus render_cb_compressed(
     end += p->hw_latency_ns + ca_get_latency(ts)
         + ca_frames_to_ns(ao, pseudo_frames);
 
-    int read_frames =
-        ao_read_data(ao, &buf.mData, pseudo_frames, end, NULL, true, true);
+    bool warming_up = atomic_load_explicit(&p->warming_up, memory_order_relaxed);
+    int read_frames = 0;
+    if (warming_up) {
+        memset(buf.mData, 0, requested);
+    } else {
+        read_frames =
+            ao_read_data(ao, &buf.mData, pseudo_frames, end, NULL, true, true);
+    }
 
     if (ao->format == AF_FORMAT_S_DOP)
         dop_hack_mygodwhy(buf.mData, pseudo_frames, read_frames,
@@ -341,6 +366,10 @@ static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
     AudioStreamRangedDescription *formats;
     size_t n_formats;
     OSStatus err;
+    bool prefer_mixable =
+        af_fmt_is_pcm(ao->format) && ao->format != AF_FORMAT_S_DOP &&
+        !p->spdif_hack;
+    bool found_mixable = false;
 
     err = CA_GET_ARY(p->stream, kAudioStreamPropertyAvailablePhysicalFormats,
                      &formats, &n_formats);
@@ -349,6 +378,17 @@ static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
     for (int j = 0; j < n_formats; j++) {
         AudioStreamBasicDescription candidate = formats[j].mFormat;
         AudioStreamBasicDescription *stream_asbd = &candidate;
+
+        if (prefer_mixable) {
+            bool nonmixable =
+                stream_asbd->mFormatFlags & kAudioFormatFlagIsNonMixable;
+            if (nonmixable && found_mixable)
+                continue;
+            if (!nonmixable && !found_mixable) {
+                *out_fmt = (AudioStreamBasicDescription){0};
+                found_mixable = true;
+            }
+        }
 
         if (ao->format == AF_FORMAT_S_DOP) {
             AudioValueRange range = formats[j].mSampleRateRange;
@@ -512,8 +552,13 @@ static int init(struct ao *ao)
         goto coreaudio_error;
     }
 
-    err = ca_disable_mixing(ao, p->device, &p->changed_mixing);
-    CHECK_CA_WARN("failed to disable mixing");
+    if (af_fmt_is_pcm(original_format) && original_format != AF_FORMAT_S_DOP) {
+        err = ca_enable_mixing(ao, p->device, true);
+        CHECK_CA_WARN("failed to keep PCM mixing enabled");
+    } else {
+        err = ca_disable_mixing(ao, p->device, &p->changed_mixing);
+        CHECK_CA_WARN("failed to disable mixing");
+    }
 
     if (select_stream(ao) < 0)
         goto coreaudio_error;
@@ -521,6 +566,7 @@ static int init(struct ao *ao)
     AudioStreamBasicDescription hwfmt;
     if (find_best_format(ao, &hwfmt) < 0)
         goto coreaudio_error;
+    p->needs_warmup = true;
 
     err = CA_GET(p->stream, kAudioStreamPropertyPhysicalFormat,
                  &p->original_asbd);
@@ -646,11 +692,21 @@ static int init(struct ao *ao)
                                     &p->render_cb);
     CHECK_CA_ERROR("failed to register audio render callback");
 
+    if (ao->format == AF_FORMAT_S_DOP) {
+        float volume = 100;
+        if (get_volume(ao, &p->original_volume) == CONTROL_TRUE) {
+            p->changed_volume = p->original_volume != volume;
+            if (set_volume(ao, &volume) != CONTROL_TRUE)
+                MP_WARN(ao, "Could not force unity volume for DoP.\n");
+        }
+    }
+
     return CONTROL_TRUE;
 
 coreaudio_error:
     err = enable_property_listener(ao, false);
     CHECK_CA_WARN("can't remove format change listener");
+    restore_dop_volume(ao);
     restore_stream_formats(ao);
     err = ca_unlock_device(p->device, &p->hog_pid);
     CHECK_CA_WARN("can't release hog mode");
@@ -673,7 +729,31 @@ static void uninit(struct ao *ao)
     err = AudioDeviceDestroyIOProcID(p->device, p->render_cb);
     CHECK_CA_WARN("failed to remove device render callback");
 
+    bool original_mute = false;
+    bool used_mute = get_mute(ao, &original_mute) == CONTROL_TRUE;
+    if (used_mute) {
+        bool muted = true;
+        used_mute = set_mute(ao, &muted) == CONTROL_TRUE;
+    }
+    float restore_volume = 100;
+    bool lowered_volume = false;
+    if (!used_mute && get_volume(ao, &restore_volume) == CONTROL_TRUE) {
+        if (p->changed_volume)
+            restore_volume = p->original_volume;
+        float silent = 0;
+        lowered_volume = set_volume(ao, &silent) == CONTROL_TRUE;
+    }
+
     restore_stream_formats(ao);
+    mp_sleep_ns(MP_TIME_S_TO_NS(3));
+    if (p->changed_volume) {
+        set_volume(ao, &p->original_volume);
+        p->changed_volume = false;
+    } else if (lowered_volume) {
+        set_volume(ao, &restore_volume);
+    }
+    if (used_mute)
+        set_mute(ao, &original_mute);
 
     err = ca_enable_mixing(ao, p->device, p->changed_mixing);
     CHECK_CA_WARN("can't re-enable mixing");
@@ -695,9 +775,44 @@ static void audio_pause(struct ao *ao)
 static void audio_resume(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    bool original_mute = false;
+    bool used_mute = false;
+    float original_volume = 100;
+    bool lowered_volume = false;
+
+    if (p->needs_warmup) {
+        // Hardware formats can be visible before the device clock is ready. Feed
+        // silence through the transition instead of leaking it as noise.
+        atomic_store_explicit(&p->warming_up, true, memory_order_relaxed);
+        if (af_fmt_is_pcm(ao->format) && ao->format != AF_FORMAT_S_DOP) {
+            used_mute = get_mute(ao, &original_mute) == CONTROL_TRUE;
+            if (used_mute) {
+                bool muted = true;
+                used_mute = set_mute(ao, &muted) == CONTROL_TRUE;
+            }
+            if (!used_mute &&
+                get_volume(ao, &original_volume) == CONTROL_TRUE) {
+                float silent = 0;
+                lowered_volume = set_volume(ao, &silent) == CONTROL_TRUE;
+            }
+        }
+        MP_INFO(ao, "Warming up exclusive output before releasing audio.\n");
+    }
 
     OSStatus err = AudioDeviceStart(p->device, p->render_cb);
     CHECK_CA_WARN("can't start audio device");
+
+    if (p->needs_warmup && err == noErr)
+        mp_sleep_ns(MP_TIME_S_TO_NS(3));
+    if (lowered_volume)
+        set_volume(ao, &original_volume);
+    if (used_mute)
+        set_mute(ao, &original_mute);
+    if (p->needs_warmup && err == noErr) {
+        p->needs_warmup = false;
+        atomic_store_explicit(&p->warming_up, false, memory_order_relaxed);
+        MP_INFO(ao, "Exclusive output clock settled.\n");
+    }
 }
 
 // Volume is handled by the device itself rather than by scaling the samples, since the
@@ -826,8 +941,16 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
 {
     switch (cmd) {
     case AOCONTROL_GET_VOLUME:
+        if (ao->format == AF_FORMAT_S_DOP) {
+            *(float *)arg = 100;
+            return CONTROL_TRUE;
+        }
         return get_volume(ao, arg);
     case AOCONTROL_SET_VOLUME:
+        if (ao->format == AF_FORMAT_S_DOP) {
+            float volume = 100;
+            return set_volume(ao, &volume);
+        }
         return set_volume(ao, arg);
     case AOCONTROL_GET_MUTE:
         return get_mute(ao, arg);
