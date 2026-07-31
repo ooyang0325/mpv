@@ -262,7 +262,7 @@ static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
         return M_OPT_EXIT;
     }
     if (strcmp(opt->name, "audio-spdif") == 0) {
-        mp_info(log, "Choices: ac3,dts-hd,dts,dsd_lsbf,dsd_msbf,"
+        mp_info(log, "Choices: ac3,dts-hd,dts,dst,dsd_lsbf,dsd_msbf,"
                      "dsd_lsbf_planar,dsd_msbf_planar (and possibly more)\n");
         return M_OPT_EXIT;
     }

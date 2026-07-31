@@ -68,6 +68,9 @@ extern const demuxer_desc_t demuxer_desc_sbr;
 #endif
 extern const demuxer_desc_t demuxer_desc_null;
 extern const demuxer_desc_t demuxer_desc_timeline;
+#if HAVE_SACD
+extern const demuxer_desc_t demuxer_desc_sacd;
+#endif
 
 static const demuxer_desc_t *const demuxer_list[] = {
     &demuxer_desc_directory,
@@ -76,6 +79,9 @@ static const demuxer_desc_t *const demuxer_list[] = {
     &demuxer_desc_cue,
     &demuxer_desc_rawaudio,
     &demuxer_desc_rawvideo,
+#if HAVE_SACD
+    &demuxer_desc_sacd,
+#endif
     &demuxer_desc_matroska,
 #if HAVE_LIBARCHIVE
     &demuxer_desc_libarchive,

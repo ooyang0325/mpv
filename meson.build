@@ -703,6 +703,13 @@ if features['libarchive']
                      'stream/stream_libarchive.c')
 endif
 
+sacd = dependency('sacd', required: get_option('sacd'))
+features += {'sacd': sacd.found()}
+if features['sacd']
+    dependencies += sacd
+    sources += files('demux/demux_sacd.c')
+endif
+
 # liborender is loaded at runtime (dlopen) against the vendored ABI header
 # common/orender_abi.h — no build-time library or pkg-config dependency. See
 # common/orender_dl.c for the search order and the version handshake.
