@@ -477,7 +477,8 @@ static void show_ui(struct mp_filter *f)
     }
 
     @autoreleasepool {
-        NSView *view = custom_view(p->unit);
+        NSView *view = p->desc.componentManufacturer == kAudioUnitManufacturer_Apple
+                     ? nil : custom_view(p->unit);
         if (!view)
             view = [[[AUGenericView alloc] initWithAudioUnit:p->unit] autorelease];
         NSSize size = view.frame.size;
