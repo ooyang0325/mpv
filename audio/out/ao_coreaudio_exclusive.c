@@ -782,13 +782,17 @@ static void uninit(struct ao *ao)
 
     bool original_mute = false;
     bool used_mute = get_mute(ao, &original_mute) == CONTROL_TRUE;
+    bool silence_hardware =
+        af_fmt_is_pcm(ao->format) && !p->pcm_to_dsd_active;
+    used_mute &= silence_hardware;
     if (used_mute) {
         bool muted = true;
         used_mute = set_mute(ao, &muted) == CONTROL_TRUE;
     }
     float restore_volume = 100;
     bool lowered_volume = false;
-    if (!used_mute && get_volume(ao, &restore_volume) == CONTROL_TRUE) {
+    if (silence_hardware && !used_mute &&
+        get_volume(ao, &restore_volume) == CONTROL_TRUE) {
         if (p->changed_volume)
             restore_volume = p->original_volume;
         float silent = 0;
