@@ -183,12 +183,19 @@ static void close_window(struct priv *p)
 
 static void close_unit(struct priv *p)
 {
-    close_window(p);
-    if (p->unit) {
-        AudioUnitUninitialize(p->unit);
-        AudioComponentInstanceDispose(p->unit);
-        p->unit = NULL;
-    }
+    AudioUnit unit = p->unit;
+    p->unit = NULL;
+    void (^close)(void) = ^{
+        close_window(p);
+        if (unit) {
+            AudioUnitUninitialize(unit);
+            AudioComponentInstanceDispose(unit);
+        }
+    };
+    if (p->window && !NSThread.isMainThread)
+        dispatch_sync(dispatch_get_main_queue(), close);
+    else
+        close();
 }
 
 static OSStatus input_cb(void *ctx, AudioUnitRenderActionFlags *flags,
