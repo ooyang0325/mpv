@@ -70,6 +70,31 @@ static void test_float_carrier(void)
     }
 }
 
+static void test_pcm_to_dsd(void)
+{
+    struct mp_pcm_to_dsd_state state;
+    mp_pcm_to_dsd_reset(&state);
+
+    assert_int_equal(mp_pcm_to_dsd_encode(&state, 0, 0), 0xd333);
+    assert_int_equal(mp_pcm_to_dsd_encode(&state, 0, 0), 0x3333);
+
+    int positive = 0;
+    int negative = 0;
+    for (int n = 0; n < 4096; n++) {
+        positive += __builtin_popcount(
+            mp_pcm_to_dsd_encode(&state, 0, 1.0));
+        negative += __builtin_popcount(
+            mp_pcm_to_dsd_encode(&state, 1, -1.0));
+    }
+    // Full-scale PCM is deliberately limited to +/-0.5 DSD amplitude.
+    assert_true(positive > 4096 * 11 && positive < 4096 * 13);
+    assert_true(negative > 4096 * 3 && negative < 4096 * 5);
+
+    mp_pcm_to_dsd_reset(&state);
+    assert_int_equal(mp_pcm_to_dsd_encode(&state, 0, 0), 0xd333);
+    assert_int_equal(mp_pcm_to_dsd_encode(&state, -1, 0), 0x6969);
+}
+
 int main(void)
 {
     assert_int_equal(af_fmt_to_bytes(AF_FORMAT_S_DOP), 4);
@@ -81,5 +106,6 @@ int main(void)
     test_layout(true, true);
     test_split_packets();
     test_float_carrier();
+    test_pcm_to_dsd();
     return 0;
 }

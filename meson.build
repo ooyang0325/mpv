@@ -15,6 +15,8 @@ project('mpv',
         ]
 )
 
+add_languages('cpp', native: false)
+
 build_root = meson.project_build_root()
 source_root = meson.project_source_root()
 python = find_program('python3')
@@ -51,6 +53,10 @@ features = {
     'libass': true,
     'libplacebo': true,
 }
+
+cpp = meson.get_compiler('cpp')
+r8brain = cpp.has_header('CDSPResampler.h')
+features += {'r8brain': r8brain}
 
 
 # generic sources
@@ -280,6 +286,10 @@ sources = files(
     'ta/ta_talloc.c',
     'ta/ta_utils.c',
 )
+
+if features['r8brain']
+    sources += files('audio/r8brain.cpp')
+endif
 
 
 # compiler stuff

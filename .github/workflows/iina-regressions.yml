@@ -32,6 +32,11 @@ jobs:
 
       - name: Build
         run: |
+          git clone --quiet --filter=blob:none \
+            https://github.com/avaneev/r8brain-free-src.git ../r8brain
+          git -C ../r8brain checkout --quiet \
+            8fff6f3db26f14a8f5e8fb871000613673db5753
+          export CPLUS_INCLUDE_PATH="$PWD/../r8brain"
           # -Dvulkan=disabled matches how IINA's other/build_dv_atmos_deps.sh configures
           # this tree: that build resolves to HAVE_VULKAN 0 and renders through the GL
           # backend. Leaving vulkan on "auto" here let CI pick it up from brew, so CI was

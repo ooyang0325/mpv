@@ -35,6 +35,12 @@
 #include "f_swresample.h"
 #include "filter_internal.h"
 
+#if HAVE_R8BRAIN
+#include "audio/r8brain.h"
+#endif
+
+#define R8BRAIN_MAX_INPUT 4096
+
 struct priv {
     struct mp_log *log;
     bool is_resampling;
@@ -47,6 +53,12 @@ struct priv {
     int reorder_out[MP_NUM_CHANNELS];
     struct mp_aframe_pool *reorder_buffer;
     struct mp_aframe_pool *out_pool;
+#if HAVE_R8BRAIN
+    struct mp_r8brain *r8brain;
+    struct mp_aframe *r8brain_fmt;
+    struct mp_aframe_pool *r8brain_pool;
+#endif
+    bool use_r8brain;
 
     int in_rate_user; // user input sample rate
     int in_rate;      // actual rate (used by lavr), adjusted for playback speed
@@ -68,6 +80,8 @@ struct priv {
 #define OPT_BASE_STRUCT struct mp_resample_opts
 const struct m_sub_options resample_conf = {
     .opts = (const m_option_t[]) {
+        {"audio-resample-engine", OPT_CHOICE(engine, {"swr", 0},
+            {"r8brain", 1})},
         {"audio-resample-filter-size", OPT_INT(filter_size), M_RANGE(0, 32)},
         {"audio-resample-phase-shift", OPT_INT(phase_shift), M_RANGE(0, 30)},
         {"audio-resample-linear", OPT_BOOL(linear)},
@@ -85,7 +99,12 @@ const struct m_sub_options resample_conf = {
 static double get_delay(struct priv *p)
 {
     int64_t base = p->in_rate * (int64_t)p->out_rate;
-    return swr_get_delay(p->avrctx, base) / (double)base;
+    double delay = swr_get_delay(p->avrctx, base) / (double)base;
+#if HAVE_R8BRAIN
+    if (p->use_r8brain)
+        delay += mp_r8brain_get_delay(p->r8brain);
+#endif
+    return delay;
 }
 static int get_out_samples(struct priv *p, int in_samples)
 {
@@ -100,6 +119,12 @@ static void close_lavrr(struct priv *p)
     TA_FREEP(&p->pre_out_fmt);
     TA_FREEP(&p->avrctx_fmt);
     TA_FREEP(&p->pool_fmt);
+#if HAVE_R8BRAIN
+    mp_r8brain_destroy(p->r8brain);
+    p->r8brain = NULL;
+    TA_FREEP(&p->r8brain_fmt);
+#endif
+    p->use_r8brain = false;
 }
 
 static int rate_from_speed(int rate, double speed)
@@ -185,7 +210,17 @@ static bool configure_lavrr(struct priv *p, bool verbose)
         goto error;
     }
 
-    if (mp_chmap_equals(&out_lavc, &map_out)) {
+    p->use_r8brain = p->opts->engine == 1 && p->in_rate != p->out_rate;
+#if !HAVE_R8BRAIN
+    if (p->use_r8brain) {
+        MP_FATAL(p, "r8brain support was not built.\n");
+        goto error;
+    }
+#endif
+
+    if (p->use_r8brain) {
+        out_samplefmtp = AV_SAMPLE_FMT_DBLP;
+    } else if (mp_chmap_equals(&out_lavc, &map_out)) {
         // No intermediate step required - output new format directly.
         out_samplefmtp = out_samplefmt;
     } else {
@@ -204,6 +239,8 @@ static bool configure_lavrr(struct priv *p, bool verbose)
 
     p->avrctx_fmt = mp_aframe_create();
     mp_aframe_config_copy(p->avrctx_fmt, p->pre_out_fmt);
+    if (p->use_r8brain)
+        mp_aframe_set_rate(p->avrctx_fmt, p->in_rate);
     mp_aframe_set_chmap(p->avrctx_fmt, &out_lavc);
     mp_aframe_set_format(p->avrctx_fmt, af_from_avformat(out_samplefmtp));
 
@@ -215,6 +252,18 @@ static bool configure_lavrr(struct priv *p, bool verbose)
     mp_aframe_config_copy(p->pool_fmt, p->avrctx_fmt);
     if (map_out.num > out_lavc.num)
         mp_aframe_set_chmap(p->pool_fmt, &map_out);
+
+#if HAVE_R8BRAIN
+    if (p->use_r8brain) {
+        p->r8brain_fmt = mp_aframe_create();
+        mp_aframe_config_copy(p->r8brain_fmt, p->pool_fmt);
+        mp_aframe_set_rate(p->r8brain_fmt, p->out_rate);
+        p->r8brain = mp_r8brain_create(p->in_rate, p->out_rate,
+                                       map_out.num, R8BRAIN_MAX_INPUT);
+        if (!p->r8brain)
+            goto error;
+    }
+#endif
 
     AVChannelLayout in_layout, out_layout;
     // orender: keep by-index (positionless) output byte-for-byte. The guard
@@ -235,7 +284,8 @@ static bool configure_lavrr(struct priv *p, bool verbose)
     av_channel_layout_uninit(&in_layout);
     av_channel_layout_uninit(&out_layout);
     av_opt_set_int(p->avrctx, "in_sample_rate",     p->in_rate, 0);
-    av_opt_set_int(p->avrctx, "out_sample_rate",    p->out_rate, 0);
+    av_opt_set_int(p->avrctx, "out_sample_rate",
+                   p->use_r8brain ? p->in_rate : p->out_rate, 0);
     av_opt_set_int(p->avrctx, "in_sample_fmt",      in_samplefmt, 0);
     av_opt_set_int(p->avrctx, "out_sample_fmt",     out_samplefmtp, 0);
 
@@ -276,6 +326,10 @@ static void swresample_reset(struct mp_filter *f)
     swr_close(p->avrctx);
     if (swr_init(p->avrctx) < 0)
         close_lavrr(p);
+#if HAVE_R8BRAIN
+    if (p->r8brain)
+        mp_r8brain_reset(p->r8brain);
+#endif
 }
 
 // This relies on the tricky way mpa was allocated.
@@ -333,6 +387,42 @@ static int resample_frame(struct SwrContext *r,
         av_i ? MPMIN(av_i->nb_samples, consume_in) : 0);
 }
 
+#if HAVE_R8BRAIN
+static struct mp_aframe *resample_r8brain(struct priv *p,
+                                          struct mp_aframe *in)
+{
+    const double *input[MP_NUM_CHANNELS] = {0};
+    const double *output[MP_NUM_CHANNELS] = {0};
+    if (in) {
+        uint8_t **planes = mp_aframe_get_data_ro(in);
+        int num_planes = mp_aframe_get_planes(in);
+        for (int n = 0; n < num_planes; n++)
+            input[n] = (double *)planes[n];
+    }
+
+    int samples = mp_r8brain_process(
+        p->r8brain, in ? input : NULL, in ? mp_aframe_get_size(in) : 0,
+        output);
+    if (samples < 0)
+        return NULL;
+    if (!samples)
+        return mp_aframe_create();
+
+    struct mp_aframe *out = mp_aframe_create();
+    mp_aframe_config_copy(out, p->r8brain_fmt);
+    if (mp_aframe_pool_allocate(p->r8brain_pool, out, samples) < 0) {
+        talloc_free(out);
+        return NULL;
+    }
+
+    uint8_t **planes = mp_aframe_get_data_rw(out);
+    int num_planes = mp_aframe_get_planes(out);
+    for (int n = 0; n < num_planes; n++)
+        memcpy(planes[n], output[n], samples * sizeof(double));
+    return out;
+}
+#endif
+
 static struct mp_frame filter_resample_output(struct priv *p,
                                               struct mp_aframe *in)
 {
@@ -346,6 +436,8 @@ static struct mp_frame filter_resample_output(struct priv *p,
     // p->in_rate already includes the speed factor.
     double s = p->opts->max_output_frame_size / 1000 * p->in_rate;
     int max_in = lrint(MPCLAMP(s, 128, INT_MAX));
+    if (p->use_r8brain)
+        max_in = MPMIN(max_in, R8BRAIN_MAX_INPUT);
     int consume_in = in ? mp_aframe_get_size(in) : 0;
     consume_in = MPMIN(consume_in, max_in);
 
@@ -369,7 +461,19 @@ static struct mp_frame filter_resample_output(struct priv *p,
     if (!reorder_planes(out, p->reorder_out, &out_chmap))
         goto error;
 
-    if (!mp_aframe_config_equals(out, p->pre_out_fmt)) {
+#if HAVE_R8BRAIN
+    if (p->use_r8brain) {
+        struct mp_aframe *resampled = resample_r8brain(
+            p, out_samples ? out : NULL);
+        talloc_free(out);
+        out = resampled;
+        if (!out)
+            goto error;
+        out_samples = mp_aframe_get_size(out);
+    }
+#endif
+
+    if (out_samples && !mp_aframe_config_equals(out, p->pre_out_fmt)) {
         struct mp_aframe *new = mp_aframe_create();
         mp_aframe_config_copy(new, p->pre_out_fmt);
         if (mp_aframe_pool_allocate(p->reorder_buffer, new, out_samples) < 0) {
@@ -626,6 +730,9 @@ struct mp_swresample *mp_swresample_create(struct mp_filter *parent,
 
     p->reorder_buffer = mp_aframe_pool_create(p);
     p->out_pool = mp_aframe_pool_create(p);
+#if HAVE_R8BRAIN
+    p->r8brain_pool = mp_aframe_pool_create(p);
+#endif
 
     return &p->public;
 }

@@ -5326,6 +5326,13 @@ Software Scaler
 Audio Resampler
 ---------------
 
+``--audio-resample-engine=<swr|r8brain>``
+    Select the final sample-rate conversion engine. ``swr`` uses
+    libswresample, including its optional SoX engine selected through
+    ``--audio-swresample-o``. ``r8brain`` uses the linear-phase,
+    double-precision r8brain-free-src converter designed by Aleksey Vaneev of
+    Voxengo.
+
 This controls the default options of any resampling done by mpv (but not within
 libavfilter, within the system audio API resampler, or any other places).
 

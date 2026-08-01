@@ -88,6 +88,9 @@ struct priv {
     bool dop_high_aligned;
     bool dop_float_hack;
     bool dop_fa_marker;
+    int pcm_to_dsd;
+    bool pcm_to_dsd_active;
+    struct mp_pcm_to_dsd_state pcm_to_dsd_state;
 
     // Output s16 physical format, float32 virtual format, ac3/dts mpv format
     bool spdif_hack;
@@ -226,6 +229,26 @@ static void dop_hack_mygodwhy(char *data, int frames, int read_frames,
     }
 }
 
+static void pcm_to_dsd(char *data, int frames, int read_frames,
+                       int channels, int format,
+                       struct mp_pcm_to_dsd_state *state)
+{
+    for (int frame = 0; frame < frames; frame++) {
+        for (int channel = 0; channel < channels; channel++) {
+            int index = frame * channels + channel;
+            uint32_t word = AV_RN32(data + index * 4);
+            double sample = 0;
+            if (frame < read_frames) {
+                sample = format == AF_FORMAT_FLOAT
+                    ? av_int2float(word)
+                    : (int32_t)word / 2147483648.0;
+            }
+            AV_WN32(data + index * 4,
+                    mp_pcm_to_dsd_encode(state, channel, sample));
+        }
+    }
+}
+
 static OSStatus render_cb_compressed(
         AudioDeviceID device, const AudioTimeStamp *ts,
         const void *in_data, const AudioTimeStamp *in_ts,
@@ -259,7 +282,11 @@ static OSStatus render_cb_compressed(
             ao_read_data(ao, &buf.mData, pseudo_frames, end, NULL, true, true);
     }
 
-    if (ao->format == AF_FORMAT_S_DOP)
+    if (p->pcm_to_dsd_active)
+        pcm_to_dsd(buf.mData, pseudo_frames, read_frames, ao->channels.num,
+                   ao->format, &p->pcm_to_dsd_state);
+
+    if (ao->format == AF_FORMAT_S_DOP || p->pcm_to_dsd_active)
         dop_hack_mygodwhy(buf.mData, pseudo_frames, read_frames,
                           ao->channels.num, p->dop_float_hack,
                           p->dop_high_aligned, &p->dop_fa_marker);
@@ -369,7 +396,7 @@ static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
     OSStatus err;
     bool prefer_mixable =
         af_fmt_is_pcm(ao->format) && ao->format != AF_FORMAT_S_DOP &&
-        !p->spdif_hack;
+        !p->pcm_to_dsd_active && !p->spdif_hack;
     bool found_mixable = false;
 
     err = CA_GET_ARY(p->stream, kAudioStreamPropertyAvailablePhysicalFormats,
@@ -391,7 +418,7 @@ static int find_best_format(struct ao *ao, AudioStreamBasicDescription *out_fmt)
             }
         }
 
-        if (ao->format == AF_FORMAT_S_DOP) {
+        if (ao->format == AF_FORMAT_S_DOP || p->pcm_to_dsd_active) {
             AudioValueRange range = formats[j].mSampleRateRange;
             if (asbd.mSampleRate >= range.mMinimum &&
                 asbd.mSampleRate <= range.mMaximum)
@@ -489,6 +516,16 @@ static int init(struct ao *ao)
 {
     struct priv *p = ao->priv;
     int original_format = ao->format;
+    p->pcm_to_dsd_active = p->pcm_to_dsd && af_fmt_is_pcm(original_format);
+    if (p->pcm_to_dsd_active) {
+        ao->samplerate = p->pcm_to_dsd == 128 ? 352800 : 176400;
+        ao->format = AF_FORMAT_FLOAT;
+        mp_pcm_to_dsd_reset(&p->pcm_to_dsd_state);
+        MP_INFO(ao, "Converting PCM to DSD%d over DoP at %d Hz.\n",
+                p->pcm_to_dsd, ao->samplerate);
+    }
+    bool dop_output = original_format == AF_FORMAT_S_DOP ||
+                      p->pcm_to_dsd_active;
 
     OSStatus err = ca_select_device(ao, ao->device, &p->device);
     CHECK_CA_ERROR_L(coreaudio_error_nounlock, "failed to select device");
@@ -553,7 +590,7 @@ static int init(struct ao *ao)
         goto coreaudio_error;
     }
 
-    if (af_fmt_is_pcm(original_format) && original_format != AF_FORMAT_S_DOP) {
+    if (af_fmt_is_pcm(original_format) && !p->pcm_to_dsd_active) {
         err = ca_enable_mixing(ao, p->device, true);
         CHECK_CA_WARN("failed to keep PCM mixing enabled");
     } else {
@@ -587,7 +624,7 @@ static int init(struct ao *ao)
         goto coreaudio_error;
     }
 
-    if (original_format == AF_FORMAT_S_DOP) {
+    if (dop_output) {
         AudioStreamBasicDescription physical = {0};
         err = CA_GET(p->stream, kAudioStreamPropertyPhysicalFormat, &physical);
         CHECK_CA_ERROR("could not get DoP physical format");
@@ -623,7 +660,7 @@ static int init(struct ao *ao)
         goto coreaudio_error;
     }
 
-    if (original_format == AF_FORMAT_S_DOP) {
+    if (dop_output) {
         if (!dop_virtual_asbd_is_supported(&p->stream_asbd, ao->samplerate,
                                            ao->channels.num))
         {
@@ -636,7 +673,15 @@ static int init(struct ao *ao)
             !p->dop_float_hack &&
             (p->stream_asbd.mBitsPerChannel == 32 ||
              (p->stream_asbd.mFormatFlags & kAudioFormatFlagIsAlignedHigh));
-        ao->format = AF_FORMAT_S_DOP;
+        if (original_format == AF_FORMAT_S_DOP) {
+            ao->format = AF_FORMAT_S_DOP;
+        } else {
+            ao->format = ca_asbd_to_mp_format(&p->stream_asbd);
+            if (ao->format != AF_FORMAT_FLOAT && ao->format != AF_FORMAT_S32) {
+                MP_ERR(ao, "PCM-to-DSD needs a 32-bit virtual carrier.\n");
+                goto coreaudio_error;
+            }
+        }
     } else {
         int new_format = ca_asbd_to_mp_format(&p->stream_asbd);
 
@@ -693,7 +738,7 @@ static int init(struct ao *ao)
                                     &p->render_cb);
     CHECK_CA_ERROR("failed to register audio render callback");
 
-    if (ao->format == AF_FORMAT_S_DOP) {
+    if (ao->format == AF_FORMAT_S_DOP || p->pcm_to_dsd_active) {
         float volume = 100;
         if (get_volume(ao, &p->original_volume) == CONTROL_TRUE) {
             p->changed_volume = p->original_volume != volume;
@@ -712,6 +757,11 @@ coreaudio_error:
     err = ca_unlock_device(p->device, &p->hog_pid);
     CHECK_CA_WARN("can't release hog mode");
     restore_default_device(ao);
+    if (p->pcm_to_dsd_active) {
+        MP_WARN(ao, "PCM-to-DSD unavailable on this device, using shared PCM output.\n");
+        ao->init_flags &= ~AO_INIT_EXCLUSIVE;
+        ao->redirect = "coreaudio";
+    }
 coreaudio_error_nounlock:
     return CONTROL_ERROR;
 }
@@ -770,6 +820,7 @@ static void audio_pause(struct ao *ao)
     OSStatus err = AudioDeviceStop(p->device, p->render_cb);
     CHECK_CA_WARN("can't stop audio device");
     p->dop_fa_marker = false;
+    mp_pcm_to_dsd_reset(&p->pcm_to_dsd_state);
 }
 
 static void audio_resume(struct ao *ao)
@@ -784,7 +835,7 @@ static void audio_resume(struct ao *ao)
         // Hardware formats can be visible before the device clock is ready. Feed
         // silence through the transition instead of leaking it as noise.
         atomic_store_explicit(&p->warming_up, true, memory_order_relaxed);
-        if (af_fmt_is_pcm(ao->format) && ao->format != AF_FORMAT_S_DOP) {
+        if (af_fmt_is_pcm(ao->format) && !p->pcm_to_dsd_active) {
             used_mute = get_mute(ao, &original_mute) == CONTROL_TRUE;
             if (used_mute) {
                 bool muted = true;
@@ -939,15 +990,16 @@ static int set_mute(struct ao *ao, bool *muted)
 
 static int control(struct ao *ao, enum aocontrol cmd, void *arg)
 {
+    struct priv *p = ao->priv;
     switch (cmd) {
     case AOCONTROL_GET_VOLUME:
-        if (ao->format == AF_FORMAT_S_DOP) {
+        if (ao->format == AF_FORMAT_S_DOP || p->pcm_to_dsd_active) {
             *(float *)arg = 100;
             return CONTROL_TRUE;
         }
         return get_volume(ao, arg);
     case AOCONTROL_SET_VOLUME:
-        if (ao->format == AF_FORMAT_S_DOP) {
+        if (ao->format == AF_FORMAT_S_DOP || p->pcm_to_dsd_active) {
             float volume = 100;
             return set_volume(ao, &volume);
         }
@@ -984,6 +1036,8 @@ const struct ao_driver audio_out_coreaudio_exclusive = {
     },
     .options = (const struct m_option[]){
         {"spdif-hack", OPT_BOOL(spdif_hack)},
+        {"pcm-to-dsd", OPT_CHOICE(pcm_to_dsd, {"off", 0},
+            {"dsd64", 64}, {"dsd128", 128}), .flags = UPDATE_AUDIO},
         {0}
     },
     .options_prefix = "coreaudio",

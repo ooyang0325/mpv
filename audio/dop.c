@@ -1,4 +1,5 @@
 #include <limits.h>
+#include <math.h>
 #include <string.h>
 
 #include "audio/dop.h"
@@ -73,4 +74,42 @@ float mp_dop_word_to_float(uint32_t word)
     if (sample & 0x800000)
         sample -= 0x1000000;
     return sample / 8388608.0f;
+}
+
+void mp_pcm_to_dsd_reset(struct mp_pcm_to_dsd_state *state)
+{
+    memset(state, 0, sizeof(*state));
+    for (int channel = 0; channel < MP_NUM_CHANNELS; channel++)
+        state->output[channel] = -1.0;
+}
+
+uint16_t mp_pcm_to_dsd_encode(struct mp_pcm_to_dsd_state *state,
+                              int channel, double sample)
+{
+    if (channel < 0 || channel >= MP_NUM_CHANNELS)
+        return 0x6969;
+
+    // Leave 6 dB of headroom so the second-order modulator stays stable at
+    // full-scale PCM. Linear interpolation moves the 176.4/352.8 kHz input
+    // smoothly through the sixteen DSD samples carried by each DoP frame.
+    sample = isfinite(sample) ? fmax(-0.5, fmin(0.5, sample * 0.5)) : 0.0;
+    double previous = state->previous[channel];
+    double i1 = state->integrator1[channel];
+    double i2 = state->integrator2[channel];
+    double output = state->output[channel];
+    uint16_t payload = 0;
+
+    for (int bit = 0; bit < 16; bit++) {
+        double input = previous + (sample - previous) * (bit + 1) / 16.0;
+        i1 += input - output;
+        i2 += i1 - output;
+        output = i2 >= 0 ? 1.0 : -1.0;
+        payload = payload << 1 | (output > 0);
+    }
+
+    state->previous[channel] = sample;
+    state->integrator1[channel] = i1;
+    state->integrator2[channel] = i2;
+    state->output[channel] = output;
+    return payload;
 }

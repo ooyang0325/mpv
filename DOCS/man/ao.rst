@@ -144,6 +144,12 @@ Available audio output drivers are:
         passthrough (even if the device reports it as supported). Use with
         extreme care.
 
+    ``--coreaudio-pcm-to-dsd=<off|dsd64|dsd128>``
+        Convert decoded PCM to DSD64 or DSD128 and carry it as DoP 1.1.
+        Requires ``--audio-exclusive=yes`` and a DAC with an exact 176.4 or
+        352.8 kHz, 24- or 32-bit integer PCM carrier. The converter reserves
+        6 dB of modulator headroom and locks hardware volume at unity.
+
 ``coreaudio_exclusive`` (macOS only)
     Native macOS audio output driver using direct device access and
     exclusive mode (bypasses the sound server).

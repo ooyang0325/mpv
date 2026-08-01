@@ -17,6 +17,7 @@ struct mp_swresample {
 };
 
 struct mp_resample_opts {
+    int engine;
     int filter_size;
     int phase_shift;
     bool linear;
@@ -28,6 +29,7 @@ struct mp_resample_opts {
 };
 
 #define MP_RESAMPLE_OPTS_DEF {  \
+    .engine      = 0,           \
     .filter_size = 16,          \
     .cutoff      = 0.0,         \
     .phase_shift = 10,          \
