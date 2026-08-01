@@ -4,7 +4,7 @@
 #import <CoreAudioKit/AUGenericView.h>
 
 #include <dispatch/dispatch.h>
-#include <stdatomic.h>
+#include <errno.h>
 #include <strings.h>
 #include <unistd.h>
 
@@ -93,8 +93,14 @@ static bool load_state(struct mp_filter *f, const char *path)
     struct priv *p = f->priv;
     if (!p->unit)
         return false;
-    if (!path || !path[0] || access(path, R_OK) != 0)
+    if (!path || !path[0])
         return true;
+    if (access(path, R_OK) != 0) {
+        if (errno == ENOENT)
+            return true;
+        MP_ERR(f, "Could not access Audio Unit state: %s\n", strerror(errno));
+        return false;
+    }
 
     @autoreleasepool {
         NSError *error = nil;
@@ -169,16 +175,10 @@ static void close_window(struct priv *p)
 {
     if (!p->window)
         return;
-    void (^close)(void) = ^{
-        [p->window orderOut:nil];
-        [p->window setContentView:nil];
-        [p->window release];
-        p->window = nil;
-    };
-    if (NSThread.isMainThread)
-        close();
-    else
-        dispatch_sync(dispatch_get_main_queue(), close);
+    [p->window orderOut:nil];
+    [p->window setContentView:nil];
+    [p->window release];
+    p->window = nil;
 }
 
 static void close_unit(struct priv *p)
@@ -269,8 +269,10 @@ static bool configure(struct mp_filter *f, struct mp_aframe *frame)
     }
     p->unit = instantiate(component);
     if (!p->unit) {
-        MP_ERR(f, "Could not instantiate %s.\n",
-               component_name(component).UTF8String);
+        @autoreleasepool {
+            MP_ERR(f, "Could not instantiate %s.\n",
+                   component_name(component).UTF8String);
+        }
         return false;
     }
 
@@ -342,9 +344,11 @@ static bool configure(struct mp_filter *f, struct mp_aframe *frame)
 
     p->max_frames = frames;
     mp_aframe_config_copy(p->format, frame);
-    MP_INFO(f, "Audio Unit %s: %d Hz, %d channels, %.3f ms latency, %.3f s tail.\n",
-            component_name(component).UTF8String, rate, channels,
-            p->latency * 1000, p->tail);
+    @autoreleasepool {
+        MP_INFO(f, "Audio Unit %s: %d Hz, %d channels, %.3f ms latency, "
+                "%.3f s tail.\n", component_name(component).UTF8String,
+                rate, channels, p->latency * 1000, p->tail);
+    }
     return true;
 }
 
@@ -559,6 +563,8 @@ static void reset(struct mp_filter *f)
 static void destroy(struct mp_filter *f)
 {
     struct priv *p = f->priv;
+    if (p->unit && p->opts->state && p->opts->state[0])
+        save_state(f, p->opts->state);
     close_unit(p);
     if (p->memory_state)
         CFRelease(p->memory_state);
