@@ -22,6 +22,8 @@ struct f_opts {
     bool bypass;
 };
 
+@class MPAudioUnitUIHost;
+
 struct priv {
     struct f_opts *opts;
     struct mp_pin *in_pin;
@@ -30,7 +32,7 @@ struct priv {
     AudioComponentDescription desc;
     AudioUnit unit;
     CFPropertyListRef memory_state;
-    NSWindow *window;
+    MPAudioUnitUIHost *ui;
     struct mp_aframe *input;
     int64_t sample_time;
     UInt32 max_frames;
@@ -76,6 +78,19 @@ static NSString *component_name(AudioComponent component)
     CFRelease(value);
     return name;
 }
+
+static NSView *custom_view(AudioUnit unit);
+
+@interface MPAudioUnitUIHost : NSObject {
+    AudioUnit _unit;
+    AudioComponentDescription _desc;
+    NSWindow *_window;
+}
+- (instancetype)initWithUnit:(AudioUnit)unit
+                 description:(AudioComponentDescription)desc;
+- (void)show;
+- (void)close;
+@end
 
 static bool set_state(struct mp_filter *f, CFPropertyListRef state)
 {
@@ -171,31 +186,34 @@ static void capture_state(struct mp_filter *f)
         p->memory_state = NULL;
 }
 
-static void close_window(struct priv *p)
+static void dispose_unit(AudioUnit unit)
 {
-    if (!p->window)
-        return;
-    [p->window orderOut:nil];
-    [p->window setContentView:nil];
-    [p->window release];
-    p->window = nil;
+    if (unit) {
+        AudioUnitUninitialize(unit);
+        AudioComponentInstanceDispose(unit);
+    }
 }
 
 static void close_unit(struct priv *p)
 {
     AudioUnit unit = p->unit;
     p->unit = NULL;
+    MPAudioUnitUIHost *ui = p->ui;
+    p->ui = nil;
+    if (!ui) {
+        dispose_unit(unit);
+        return;
+    }
+
     void (^close)(void) = ^{
-        close_window(p);
-        if (unit) {
-            AudioUnitUninitialize(unit);
-            AudioComponentInstanceDispose(unit);
-        }
+        [ui close];
+        dispose_unit(unit);
+        [ui release];
     };
-    if (p->window && !NSThread.isMainThread)
-        dispatch_sync(dispatch_get_main_queue(), close);
-    else
+    if (NSThread.isMainThread)
         close();
+    else
+        dispatch_async(dispatch_get_main_queue(), close);
 }
 
 static OSStatus input_cb(void *ctx, AudioUnitRenderActionFlags *flags,
@@ -479,34 +497,63 @@ static NSView *custom_view(AudioUnit unit)
     return view;
 }
 
-static void show_ui(struct mp_filter *f)
+@implementation MPAudioUnitUIHost
+
+- (instancetype)initWithUnit:(AudioUnit)unit
+                 description:(AudioComponentDescription)desc
 {
-    struct priv *p = f->priv;
-    if (p->window) {
-        [p->window makeKeyAndOrderFront:nil];
+    if ((self = [super init])) {
+        _unit = unit;
+        _desc = desc;
+    }
+    return self;
+}
+
+- (void)show
+{
+    if (_window) {
+        [_window makeKeyAndOrderFront:nil];
         return;
     }
 
     @autoreleasepool {
-        NSView *view = p->desc.componentManufacturer == kAudioUnitManufacturer_Apple
-                     ? nil : custom_view(p->unit);
+        NSView *view = _desc.componentManufacturer == kAudioUnitManufacturer_Apple
+                     ? nil : custom_view(_unit);
         if (!view)
-            view = [[[AUGenericView alloc] initWithAudioUnit:p->unit] autorelease];
+            view = [[[AUGenericView alloc] initWithAudioUnit:_unit] autorelease];
         NSSize size = view.frame.size;
         if (size.width < 100 || size.height < 100)
             size = NSMakeSize(640, 480);
-        p->window = [[NSWindow alloc]
+        _window = [[NSWindow alloc]
             initWithContentRect:NSMakeRect(0, 0, size.width, size.height)
             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                       NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
             backing:NSBackingStoreBuffered defer:NO];
-        p->window.releasedWhenClosed = NO;
-        p->window.title = component_name(AudioComponentInstanceGetComponent(p->unit));
-        p->window.contentView = view;
-        [p->window center];
-        [p->window makeKeyAndOrderFront:nil];
+        _window.releasedWhenClosed = NO;
+        _window.title = component_name(AudioComponentInstanceGetComponent(_unit));
+        _window.contentView = view;
+        [_window center];
+        [_window makeKeyAndOrderFront:nil];
     }
 }
+
+- (void)close
+{
+    if (!_window)
+        return;
+    [_window orderOut:nil];
+    [_window setContentView:nil];
+    [_window release];
+    _window = nil;
+}
+
+- (void)dealloc
+{
+    [self close];
+    [super dealloc];
+}
+
+@end
 
 static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
 {
@@ -521,10 +568,14 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
     if (!strcmp(cmd->cmd, "show-ui")) {
         if (!p->unit)
             return false;
-        if (NSThread.isMainThread)
-            show_ui(f);
-        else
-            dispatch_sync(dispatch_get_main_queue(), ^{ show_ui(f); });
+        if (!p->ui)
+            p->ui = [[MPAudioUnitUIHost alloc] initWithUnit:p->unit
+                                               description:p->desc];
+        MPAudioUnitUIHost *ui = [p->ui retain];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ui show];
+            [ui release];
+        });
         return true;
     }
     if (!strcmp(cmd->cmd, "save-state"))
