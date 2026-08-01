@@ -76,6 +76,7 @@ struct pl_video {
     ra_queue queue;        // The frame queue for handling video frames and interpolation.
     uint64_t last_frame_id;// To avoid pushing duplicate frames into the queue.
     double last_pts;       // Last presentation timestamp we rendered at, for redraws.
+    bool warned_no_nlq;    // Only complain once per session about a droppable EL.
 
     // Render State
     struct mp_image_params current_params; // Current video parameters (resolution, colorspace, etc.).
@@ -422,6 +423,21 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
                                          el_par.chroma_location);
             fp->has_el = true;
             frame->enhancement_layer = &fp->el_frame;
+
+            // libplacebo composes the enhancement layer only when the RPU has
+            // NLQ active (renderer.c: compose_el / acquire_el). Otherwise it
+            // drops the layer silently and renders the base picture, which
+            // looks like working Dolby Vision but is not. Say so once, so the
+            // difference is diagnosable rather than invisible.
+            if (!p->warned_no_nlq &&
+                (frame->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION ||
+                 !frame->repr.dovi || !frame->repr.dovi->nlq_active))
+            {
+                p->warned_no_nlq = true;
+                mp_msg(p->log, MSGL_WARN, "Dolby Vision enhancement layer is "
+                       "present but its RPU does not enable NLQ, so it cannot "
+                       "be composed; rendering base layer only.\n");
+            }
         } else {
             // The base layer on its own is still a valid picture, so fall back
             // to it rather than dropping the frame.
@@ -798,6 +814,39 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
 
     // Point the render params' pointer to our local struct.
     params.color_adjustment = &color_adj;
+
+    // Honour --tone-mapping. Everything else in pl_render_default_params is left
+    // alone: the library defaults (perceptual gamut mapping, peak detection on,
+    // blue-noise dither) are already the right choices here. But the tone curve is
+    // user-facing -- IINA exposes it as a preference -- and leaving it at the default
+    // meant selecting BT.2390, Hable, Reinhard or Mobius silently did nothing and
+    // every source was mapped with the spline curve regardless.
+    static const struct pl_tone_map_function * const tone_map_funs[] = {
+        [TONE_MAPPING_AUTO]      = &pl_tone_map_auto,
+        [TONE_MAPPING_CLIP]      = &pl_tone_map_clip,
+        [TONE_MAPPING_MOBIUS]    = &pl_tone_map_mobius,
+        [TONE_MAPPING_REINHARD]  = &pl_tone_map_reinhard,
+        [TONE_MAPPING_HABLE]     = &pl_tone_map_hable,
+        [TONE_MAPPING_GAMMA]     = &pl_tone_map_gamma,
+        [TONE_MAPPING_LINEAR]    = &pl_tone_map_linear,
+        [TONE_MAPPING_SPLINE]    = &pl_tone_map_spline,
+        [TONE_MAPPING_BT_2390]   = &pl_tone_map_bt2390,
+        [TONE_MAPPING_BT_2446A]  = &pl_tone_map_bt2446a,
+        [TONE_MAPPING_ST2094_40] = &pl_tone_map_st2094_40,
+        [TONE_MAPPING_ST2094_10] = &pl_tone_map_st2094_10,
+    };
+
+    struct pl_color_map_params color_map = pl_color_map_default_params;
+    if (vopts->tone_map.curve >= 0 &&
+        vopts->tone_map.curve < MP_ARRAY_SIZE(tone_map_funs) &&
+        tone_map_funs[vopts->tone_map.curve])
+    {
+        color_map.tone_mapping_function = tone_map_funs[vopts->tone_map.curve];
+    }
+    if (!isnan(vopts->tone_map.curve_param))
+        color_map.tone_mapping_param = vopts->tone_map.curve_param;
+    color_map.inverse_tone_mapping = vopts->tone_map.inverse;
+    params.color_map_params = &color_map;
 
     // This backend does not interpolate, so render the nearest queued frame
     // directly. Besides avoiding pointless frame-mix setup, pl_render_image()
