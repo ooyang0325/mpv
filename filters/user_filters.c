@@ -33,6 +33,9 @@ static bool check_unknown_entry(const char *name, int media_type)
 const struct mp_user_filter_entry *af_list[] = {
     &af_lavfi,
     &af_lavfi_bridge,
+#if HAVE_COREAUDIO
+    &af_audiounit,
+#endif
     &af_scaletempo,
     &af_scaletempo2,
     &af_lavfi_tempo,

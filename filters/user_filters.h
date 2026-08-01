@@ -20,6 +20,7 @@ struct mp_filter *mp_create_user_filter(struct mp_filter *parent,
 
 extern const struct mp_user_filter_entry af_lavfi;
 extern const struct mp_user_filter_entry af_lavfi_bridge;
+extern const struct mp_user_filter_entry af_audiounit;
 extern const struct mp_user_filter_entry af_scaletempo;
 extern const struct mp_user_filter_entry af_scaletempo2;
 extern const struct mp_user_filter_entry af_lavfi_tempo;
