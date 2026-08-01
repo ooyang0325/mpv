@@ -32,9 +32,14 @@ jobs:
 
       - name: Build
         run: |
+          # -Dvulkan=disabled matches how IINA's other/build_dv_atmos_deps.sh configures
+          # this tree: that build resolves to HAVE_VULKAN 0 and renders through the GL
+          # backend. Leaving vulkan on "auto" here let CI pick it up from brew, so CI was
+          # compiling a different render configuration than the one anyone tests against
+          # real hardware, and a GL-only regression could pass here and still ship.
           meson setup build --buildtype=release \
             -Dtests=true -Dlibmpv=true -Dcplayer=false \
-            -Dorender=enabled -Dsacd=disabled
+            -Dorender=enabled -Dsacd=disabled -Dvulkan=disabled
           meson compile -C build
 
       - name: Test

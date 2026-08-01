@@ -241,7 +241,8 @@ static OSStatus render_cb_compressed(
 
     // we expect the callback to read full frames, which are aligned accordingly
     if (pseudo_frames * sstride != requested) {
-        MP_ERR(ao, "Unsupported unaligned read of %d bytes.\n", requested);
+        // No logging here: this is the realtime HAL callback, and MP_ERR formats a
+        // string and takes the log lock. Returning the error is the whole fix.
         return kAudioHardwareUnspecifiedError;
     }
 
@@ -745,7 +746,6 @@ static void uninit(struct ao *ao)
     }
 
     restore_stream_formats(ao);
-    mp_sleep_ns(MP_TIME_S_TO_NS(3));
     if (p->changed_volume) {
         set_volume(ao, &p->original_volume);
         p->changed_volume = false;

@@ -296,14 +296,16 @@ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
 bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame,
                                         const struct mp_image *img)
 {
-    // Initialize the frame with color space and crop metadata.
-    *out_frame = (struct pl_frame){
-        .color = img->params.color,
-        .repr = img->params.repr,
-        .crop = {
-            .x0 = 0, .y0 = 0,
-            .x1 = img->w, .y1 = img->h,
-        },
+    // Initialize the frame with color space and crop metadata. Assign the fields this
+    // function owns rather than replacing the struct: a compound literal here silently
+    // cleared everything the caller had already set, and rotation -- which the VO
+    // advertises via VO_CAP_ROTATE90 and libplacebo reads back off the frame -- went 3 -> 0,
+    // so rotated video rendered upright on the software-decode path.
+    out_frame->color = img->params.color;
+    out_frame->repr = img->params.repr;
+    out_frame->crop = (struct pl_rect2df){
+        .x0 = 0, .y0 = 0,
+        .x1 = img->w, .y1 = img->h,
     };
 
     // Convert the mpv format to libplacebo's plane data description.

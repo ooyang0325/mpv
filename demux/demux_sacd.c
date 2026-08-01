@@ -50,10 +50,15 @@ static bool read_packet(struct demuxer *demuxer, struct demux_packet **out)
         return false;
     }
 
+    if (size > sizeof(p->frame)) {
+        MP_ERR(demuxer, "SACD frame larger than the buffer it was read into.\n");
+        return false;
+    }
+
     struct demux_packet *packet =
         new_demux_packet(demuxer->packet_pool, size);
     if (!packet)
-        return true;
+        return false;
     memcpy(packet->buffer, p->frame, size);
 
     packet->stream = p->stream->index;

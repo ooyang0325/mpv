@@ -50,8 +50,12 @@ struct priv {
 
 static int pts_cmp(double a, double b)
 {
+    // An unknown timestamp is not a match. Returning 0 here meant "same access unit",
+    // which is the branch that fuses the enhancement layer's RPU and colorimetry onto
+    // the base frame -- so an untimed frame could overwrite the base layer's colour
+    // with an arbitrary EL's. Report "greater" so the caller holds the frame instead.
     if (a == MP_NOPTS_VALUE || b == MP_NOPTS_VALUE)
-        return 0;
+        return 1;
     if (a < b - PTS_MATCH_TOLERANCE) return -1;
     if (a > b + PTS_MATCH_TOLERANCE) return  1;
     return 0;

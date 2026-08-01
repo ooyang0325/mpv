@@ -225,6 +225,12 @@ static void hwdec_sync(pl_gpu gpu, struct mp_image *mpi, struct frame_priv *fp)
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     struct pl_video *p = fp->p;
+    // Guard the base mapper: this function is also reached from hwdec_release_el(),
+    // where the *enhancement* layer is hardware-decoded but the base layer may not be,
+    // in which case p->hwdec_mapper was never created. It can also be NULL after a
+    // mid-stream params change whose mapper re-creation failed.
+    if (!p->hwdec_mapper)
+        goto finish;
     struct ra *ra = p->hwdec_mapper->ra;
     if (ra_is_gl(ra)) {
         GL *gl = ra_gl_get(ra);
@@ -292,6 +298,10 @@ static bool hwdec_acquire_el(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *el = bl->enhancement_layer;
     struct frame_priv *fp = bl->priv;
     struct pl_video *p = fp->p;
+    // Match hwdec_acquire(): a fresh acquisition has not been fenced yet, so clearing
+    // this here keeps the enhancement-layer path from skipping its sync on the
+    // strength of a flag the base layer set on a previous frame.
+    fp->hwdec_synced = false;
     if (!hwdec_reconfig(p, &p->el_hwdec_mapper, fp->el_hwdec, &el->params) ||
         ra_hwdec_mapper_map(p->el_hwdec_mapper, el) < 0)
         return false;
@@ -364,8 +374,6 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
             talloc_free(mpi);
             return false;
         }
-        // The upload initializes the frame, restore callback data.
-        frame->user_data = mpi;
     }
 
     // Subsampled chroma planes are not co-sited with luma, so libplacebo has to
@@ -738,14 +746,17 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     }
 
     // Manually build the final mix for the renderer, including the signatures.
-    // We need a local array to hold the signature data. 32 is a safe upper bound.
+    // Clamp rather than assert: assert() compiles out under NDEBUG, so in a release
+    // build a longer mix wrote past this array instead of aborting.
     uint64_t signatures[32];
-    assert(queue_mix.num_frames < MP_ARRAY_SIZE(signatures));
-    for (int i = 0; i < queue_mix.num_frames; i++) {
+    int num_signatures = MPMIN(queue_mix.num_frames, MP_ARRAY_SIZE(signatures));
+    assert(queue_mix.num_frames <= MP_ARRAY_SIZE(signatures));
+    for (int i = 0; i < num_signatures; i++) {
         // Use the mp_image pointer as a unique signature for caching.
         signatures[i] = (uintptr_t)queue_mix.frames[i]->user_data;
     }
     struct pl_frame_mix mix = queue_mix;
+    mix.num_frames = num_signatures;
     mix.signatures = signatures;
 
     // Generate and attach OSD overlays to the target frame. If mix.num_frames is 0,
