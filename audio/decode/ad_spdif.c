@@ -219,6 +219,9 @@ static void ad_spdif_reset(struct mp_filter *da)
 
     close_lavf_context(spdif_ctx, false);
     spdif_ctx->dropped_startup_packets = 0;
+    mp_dop_reset(&spdif_ctx->dop);
+    if (spdif_ctx->dop_decoder)
+        avcodec_flush_buffers(spdif_ctx->dop_decoder);
 }
 
 static bool truehd_has_major_sync(const AVPacket *pkt)
@@ -652,14 +655,6 @@ struct mp_decoder_list *select_spdif_codec(const char *codec, const char *pref)
                    dop ? "DSD over PCM pass-through decoder"
                        : "libavformat/spdifenc audio pass-through decoder");
     return list;
-}
-
-static void ad_spdif_reset(struct mp_filter *da)
-{
-    struct spdifContext *ctx = da->priv;
-    mp_dop_reset(&ctx->dop);
-    if (ctx->dop_decoder)
-        avcodec_flush_buffers(ctx->dop_decoder);
 }
 
 static const struct mp_filter_info ad_spdif_filter = {
