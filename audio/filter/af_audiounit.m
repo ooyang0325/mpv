@@ -524,15 +524,34 @@ static NSView *custom_view(AudioUnit unit)
         NSSize size = view.frame.size;
         if (size.width < 100 || size.height < 100)
             size = NSMakeSize(640, 480);
+        view.frame = NSMakeRect(0, 0, size.width, size.height);
+
+        NSRect visible = NSScreen.mainScreen.visibleFrame;
+        NSSize viewport = NSMakeSize(MIN(size.width, visible.size.width - 80),
+                                     MIN(size.height, visible.size.height - 80));
+        NSScrollView *scroll = [[[NSScrollView alloc]
+            initWithFrame:NSMakeRect(0, 0, viewport.width, viewport.height)]
+            autorelease];
+        scroll.drawsBackground = NO;
+        scroll.borderType = NSNoBorder;
+        scroll.hasHorizontalScroller = YES;
+        scroll.hasVerticalScroller = YES;
+        scroll.autohidesScrollers = YES;
+        scroll.documentView = view;
+
         _window = [[NSWindow alloc]
-            initWithContentRect:NSMakeRect(0, 0, size.width, size.height)
+            initWithContentRect:NSMakeRect(0, 0, viewport.width, viewport.height)
             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                       NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
             backing:NSBackingStoreBuffered defer:NO];
         _window.releasedWhenClosed = NO;
         _window.title = component_name(AudioComponentInstanceGetComponent(_unit));
-        _window.contentView = view;
+        _window.contentView = scroll;
         [_window center];
+        NSPoint top = NSMakePoint(0, view.isFlipped ? 0 :
+            MAX(0, size.height - scroll.contentView.bounds.size.height));
+        [scroll.contentView scrollToPoint:top];
+        [scroll reflectScrolledClipView:scroll.contentView];
         [_window makeKeyAndOrderFront:nil];
     }
 }
