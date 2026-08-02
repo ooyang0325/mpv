@@ -364,6 +364,14 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         .rotation = par.rotate / 90,
         .user_data = mpi,
     };
+    if (mp_image_crop_valid(&par)) {
+        frame->crop = (struct pl_rect2df) {
+            .x0 = par.crop.x0,
+            .y0 = par.crop.y0,
+            .x1 = par.crop.x1,
+            .y1 = par.crop.y1,
+        };
+    }
 
     if (fp->hwdec) {
         struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(par.imgfmt);

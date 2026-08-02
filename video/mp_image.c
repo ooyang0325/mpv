@@ -1194,6 +1194,22 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
         dst->dovi_residual_mode = header->disable_residual_flag ? 1 : 2;
+        for (int n = 0; n < metadata->num_ext_blocks; n++) {
+            const AVDOVIDmData *dm = av_dovi_get_ext(metadata, n);
+            if (dm->level != 5)
+                continue;
+            struct mp_rect crop = {
+                .x0 = MPMAX(dst->params.crop.x0, dm->l5.left_offset),
+                .y0 = MPMAX(dst->params.crop.y0, dm->l5.top_offset),
+                .x1 = MPMIN(dst->params.crop.x1,
+                            src->width - dm->l5.right_offset),
+                .y1 = MPMIN(dst->params.crop.y1,
+                            src->height - dm->l5.bottom_offset),
+            };
+            if (crop.x1 > crop.x0 && crop.y1 > crop.y0)
+                dst->params.crop = crop;
+            break;
+        }
 #if PL_API_VER < 364
         if (header->disable_residual_flag)
 #elif PL_API_VER < 370
