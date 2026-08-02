@@ -7565,6 +7565,12 @@ them.
     ``auto`` is the default and assumes 1000:1 contrast as a typical SDR display
     would have or an infinite contrast when HDR ``--target-trc`` is used.
     If supported by the API, display contrast will be used as reported.
+
+``--dovi-level5-mode=<mask|crop>``
+    Controls how Dolby Vision Level 5 active-area offsets are presented.
+    ``mask`` (the default) keeps the coded frame geometry stable and fills the
+    inactive area with black. ``crop`` changes the displayed video geometry to
+    the active area, which may resize the player window when offsets change.
     ``inf`` contrast specifies display with perfect black level, in practice OLED.
     (Only for ``--vo=gpu-next``)
 

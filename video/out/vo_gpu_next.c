@@ -890,6 +890,14 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     };
 
     const struct gl_video_opts *opts = p->opts_cache->opts;
+    struct mp_rect crop = par.crop;
+    if (opts->dovi_level5_mode == MP_DOVI_LEVEL5_MASK)
+        mp_image_dovi_level5_mask(mpi, &crop, NULL);
+    if (crop.x1 > crop.x0 && crop.y1 > crop.y0) {
+        frame->crop = (struct pl_rect2df) {
+            .x0 = crop.x0, .y0 = crop.y0, .x1 = crop.x1, .y1 = crop.y1,
+        };
+    }
     float ref_luma;
     if (!pl_color_transfer_is_hdr(frame->color.transfer) && (ref_luma = get_ref_luma(p)))
         frame->color.hdr.max_luma = ref_luma;
@@ -1511,13 +1519,22 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             target.color.transfer = PL_COLOR_TRC_SRGB;
 #endif
     }
+    struct mp_rect render_dst = p->dst;
+    bool level5_mask = opts->dovi_level5_mode == MP_DOVI_LEVEL5_MASK &&
+                       frame->current &&
+                       mp_image_dovi_level5_mask(frame->current, NULL,
+                                                &render_dst);
+    if (level5_mask)
+        params.border = PL_CLEAR_COLOR;
+    apply_crop(&target, render_dst, swframe.fbo->params.w,
+               swframe.fbo->params.h);
+
     stats_time_start(p->stats, "osd-update");
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
                     frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
     stats_time_end(p->stats, "osd-update");
-    apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
 
     struct pl_frame_mix mix = {0};
@@ -1568,7 +1585,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             struct pl_frame *image = (struct pl_frame *) mix.frames[i];
             struct mp_image *mpi = image->user_data;
             struct frame_priv *fp = mpi->priv;
-            apply_crop(image, p->src, vo->params->w, vo->params->h);
+            struct mp_rect render_src = p->src;
+            if (opts->dovi_level5_mode == MP_DOVI_LEVEL5_MASK)
+                mp_image_dovi_level5_mask(mpi, &render_src, NULL);
+            apply_crop(image, render_src, vo->params->w, vo->params->h);
             if (opts->blend_subs) {
                 if (frame->redraw)
                     p->osd_sync++;
@@ -1911,6 +1931,10 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         target.color.transfer = PL_COLOR_TRC_GAMMA22;
     }
 
+    bool level5_mask = opts->dovi_level5_mode == MP_DOVI_LEVEL5_MASK &&
+                       mp_image_dovi_level5_mask(mpi, &src, &dst);
+    if (level5_mask)
+        params.border = PL_CLEAR_COLOR;
     apply_crop(&image, src, mpi->params.w, mpi->params.h);
     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);

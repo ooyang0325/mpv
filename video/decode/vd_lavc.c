@@ -53,6 +53,7 @@
 #include "video/csputils.h"
 #include "video/sws_utils.h"
 #include "video/out/vo.h"
+#include "video/out/gpu/video.h"
 
 #include "options/m_option.h"
 
@@ -201,6 +202,8 @@ typedef struct lavc_ctx {
     struct vd_lavc_params *opts;
     struct m_config_cache *hwdec_opts_cache;
     struct hwdec_opts *hwdec_opts;
+    struct m_config_cache *video_opts_cache;
+    struct gl_video_opts *video_opts;
     struct mp_codec_params *codec;
     AVCodecContext *avctx;
     AVFrame *pic;
@@ -1313,6 +1316,10 @@ static int decode_frame(struct mp_filter *vd)
         av_frame_unref(ctx->pic);
         return ret;
     }
+    m_config_cache_update(ctx->video_opts_cache);
+    if (ctx->video_opts->dovi_level5_mode == MP_DOVI_LEVEL5_CROP &&
+        mp_image_dovi_active_area_valid(mpi))
+        mpi->params.crop = mpi->dovi_active_area;
 
     if (mpi->imgfmt == IMGFMT_CUDA && !mpi->planes[0]) {
         MP_ERR(vd, "CUDA frame without data. This is a FFmpeg bug.\n");
@@ -1505,6 +1512,8 @@ static struct mp_decoder *create(struct mp_filter *parent,
     ctx->opts = ctx->opts_cache->opts;
     ctx->hwdec_opts_cache = m_config_cache_alloc(ctx, vd->global, &hwdec_conf);
     ctx->hwdec_opts = ctx->hwdec_opts_cache->opts;
+    ctx->video_opts_cache = m_config_cache_alloc(ctx, vd->global, &gl_video_conf);
+    ctx->video_opts = ctx->video_opts_cache->opts;
     ctx->codec = codec;
     ctx->decoder = talloc_strdup(ctx, decoder);
     ctx->hwdec_swpool = mp_image_pool_new(ctx);

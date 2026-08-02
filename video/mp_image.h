@@ -124,6 +124,8 @@ typedef struct mp_image {
     struct AVBufferRef *a53_cc;
     // Dolby Vision metadata, if any
     struct AVBufferRef *dovi;
+    // Dolby Vision Level 5 active area, kept separate from normal codec crop.
+    struct mp_rect dovi_active_area;
     // Film grain data, if any
     struct AVBufferRef *film_grain;
     // Other side data we don't care about.
@@ -193,6 +195,9 @@ char *mp_image_params_to_str_buf(char *b, size_t bs,
 #define mp_image_params_to_str(p) mp_image_params_to_str_buf((char[256]){0}, 256, p)
 
 bool mp_image_crop_valid(const struct mp_image_params *p);
+bool mp_image_dovi_active_area_valid(const struct mp_image *img);
+bool mp_image_dovi_level5_mask(const struct mp_image *img,
+                               struct mp_rect *src, struct mp_rect *dst);
 bool mp_image_params_valid(const struct mp_image_params *p);
 bool mp_image_params_equal(const struct mp_image_params *p1,
                            const struct mp_image_params *p2);

@@ -563,6 +563,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.sys_orig = src->params.sys_orig;
     dst->params.no_dovi = src->params.no_dovi;
     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+    dst->dovi_active_area = src->dovi_active_area;
     dst->dovi_residual_mode = src->dovi_residual_mode;
     dst->dovi_el_paired = src->dovi_el_paired;
     dst->dovi_el_pairs = src->dovi_el_pairs;
@@ -779,6 +780,43 @@ bool mp_image_crop_valid(const struct mp_image_params *p)
     return p->crop.x1 > p->crop.x0 && p->crop.y1 > p->crop.y0 &&
            p->crop.x0 >= 0 && p->crop.y0 >= 0 &&
            p->crop.x1 <= p->w && p->crop.y1 <= p->h;
+}
+
+bool mp_image_dovi_active_area_valid(const struct mp_image *img)
+{
+    const struct mp_rect *r = &img->dovi_active_area;
+    return r->x1 > r->x0 && r->y1 > r->y0 &&
+           r->x0 >= 0 && r->y0 >= 0 &&
+           r->x1 <= img->params.w && r->y1 <= img->params.h;
+}
+
+bool mp_image_dovi_level5_mask(const struct mp_image *img,
+                               struct mp_rect *src, struct mp_rect *dst)
+{
+    if (!mp_image_dovi_active_area_valid(img))
+        return false;
+
+    struct mp_rect canvas = img->params.crop;
+    if (!mp_image_crop_valid(&img->params))
+        canvas = (struct mp_rect){0, 0, img->params.w, img->params.h};
+    const struct mp_rect active = img->dovi_active_area;
+    int cw = mp_rect_w(canvas);
+    int ch = mp_rect_h(canvas);
+    if (active.x0 < canvas.x0 || active.y0 < canvas.y0 ||
+        active.x1 > canvas.x1 || active.y1 > canvas.y1 || cw <= 0 || ch <= 0)
+        return false;
+
+    if (src)
+        *src = active;
+    if (dst) {
+        int dw = dst->x1 - dst->x0;
+        int dh = dst->y1 - dst->y0;
+        dst->x0 += (int64_t)(active.x0 - canvas.x0) * dw / cw;
+        dst->x1 -= (int64_t)(canvas.x1 - active.x1) * dw / cw;
+        dst->y0 += (int64_t)(active.y0 - canvas.y0) * dh / ch;
+        dst->y1 -= (int64_t)(canvas.y1 - active.y1) * dh / ch;
+    }
+    return true;
 }
 
 // Display size derived from image size and pixel aspect ratio.
@@ -1207,7 +1245,7 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
                             src->height - dm->l5.bottom_offset),
             };
             if (crop.x1 > crop.x0 && crop.y1 > crop.y0)
-                dst->params.crop = crop;
+                dst->dovi_active_area = crop;
             break;
         }
 #if PL_API_VER < 364

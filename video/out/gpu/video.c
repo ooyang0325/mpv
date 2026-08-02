@@ -361,6 +361,7 @@ static const struct m_opt_choice_alternatives filter_windows[] = {
 };
 
 static const struct gl_video_opts gl_video_opts_def = {
+    .dovi_level5_mode = MP_DOVI_LEVEL5_MASK,
     .dither_algo = DITHER_FRUIT,
     .dither_size = 6,
     .temporal_dither_period = 1,
@@ -453,6 +454,8 @@ const struct m_sub_options gl_video_conf = {
             {"no", 0}, {"input", 1}, {"output", 2}, {"both", 1|2}, {"auto", 1|2|4})},
         {"target-contrast", OPT_CHOICE(target_contrast, {"auto", 0}, {"inf", -1}),
             M_RANGE(10, 10 / PL_COLOR_HDR_BLACK)},
+        {"dovi-level5-mode", OPT_CHOICE(dovi_level5_mode,
+            {"mask", MP_DOVI_LEVEL5_MASK}, {"crop", MP_DOVI_LEVEL5_CROP})},
         {"target-gamut", OPT_STRING_VALIDATE(target_gamut, validate_target_gamut)},
         {"tone-mapping", OPT_CHOICE(tone_map.curve,
             {"auto",     TONE_MAPPING_AUTO},

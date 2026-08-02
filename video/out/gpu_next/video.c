@@ -364,12 +364,16 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         .rotation = par.rotate / 90,
         .user_data = mpi,
     };
-    if (mp_image_crop_valid(&par)) {
+    struct mp_rect crop = par.crop;
+    const struct gl_video_opts *vopts = p->opts_cache->opts;
+    if (vopts->dovi_level5_mode == MP_DOVI_LEVEL5_MASK)
+        mp_image_dovi_level5_mask(mpi, &crop, NULL);
+    if (crop.x1 > crop.x0 && crop.y1 > crop.y0) {
         frame->crop = (struct pl_rect2df) {
-            .x0 = par.crop.x0,
-            .y0 = par.crop.y0,
-            .x1 = par.crop.x1,
-            .y1 = par.crop.y1,
+            .x0 = crop.x0,
+            .y0 = crop.y0,
+            .x1 = crop.x1,
+            .y1 = crop.y1,
         };
     }
 
@@ -768,6 +772,17 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     if (queue_mix.num_frames > 0 && queue_mix.frames) {
         representative_img = queue_mix.frames[0]->user_data;
     }
+    bool level5_mask = vopts->dovi_level5_mode == MP_DOVI_LEVEL5_MASK &&
+                       representative_img;
+    if (level5_mask) {
+        struct mp_rect dst = p->current_dst;
+        level5_mask = mp_image_dovi_level5_mask(representative_img, NULL, &dst);
+        if (level5_mask) {
+            target_frame.crop = (struct pl_rect2df) {
+                .x0 = dst.x0, .y0 = dst.y0, .x1 = dst.x1, .y1 = dst.y1,
+            };
+        }
+    }
 
     // Manually build the final mix for the renderer, including the signatures.
     // Clamp rather than assert: assert() compiles out under NDEBUG, so in a release
@@ -799,6 +814,8 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // sources leaves the tone curve unmanaged and renders them clipped,
     // oversaturated and over-contrasty.
     struct pl_render_params params = pl_render_default_params;
+    if (level5_mask)
+        params.border = PL_CLEAR_COLOR;
     // This backend presents one frame at a time and does not interpolate.
     // Keeping the default mixer would inspect deferred hwdec planes before
     // their acquire callbacks have mapped the decoder surfaces.

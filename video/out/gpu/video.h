@@ -142,6 +142,7 @@ struct gl_video_opts {
     int sdr_adjust_gamma;
     int treat_srgb_as_power22;
     int target_contrast;
+    int dovi_level5_mode;
     char *target_gamut;
     struct gl_tone_map_opts tone_map;
     bool correct_downscaling;
@@ -178,6 +179,11 @@ struct gl_video_opts {
     int early_flush;
     char *shader_cache_dir;
     char *hwdec_interop;
+};
+
+enum mp_dovi_level5_mode {
+    MP_DOVI_LEVEL5_MASK = 0,
+    MP_DOVI_LEVEL5_CROP = 1,
 };
 
 extern const struct m_sub_options gl_video_conf;
