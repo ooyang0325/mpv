@@ -112,10 +112,10 @@ static void test_rle_end_of_line(void)
     uint32_t white = conv(235, 128, 128, 255);
 
     // A zero-length run terminates the current line. Pixels drawn before it are
-    // kept; the rest of the line is left to the caller's pre-cleared buffer.
+    // kept; the rest of the line is cleared to transparent.
     uint32_t buf[4];
     for (int i = 0; i < 4; i++)
-        buf[i] = 0;
+        buf[i] = 0xDEADBEEF;
     struct mp_bd_rle_elem rle[] = { {2, 1}, {0, 0} };
     mp_bd_decode_rle(buf, 4, 4, 1, pal, rle);
     assert_int_equal(buf[0], white);
@@ -168,7 +168,9 @@ static void test_rle_empty_line(void)
         {0, 0}, // empty line
         {2, 1},
     };
-    uint32_t buf[4] = {0};
+    uint32_t buf[4];
+    for (int i = 0; i < 4; i++)
+        buf[i] = 0xDEADBEEF;
     mp_bd_decode_rle(buf, 2, 2, 2, pal, rle);
     assert_int_equal(buf[0], 0);
     assert_int_equal(buf[1], 0);

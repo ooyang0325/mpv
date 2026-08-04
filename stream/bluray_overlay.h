@@ -94,6 +94,9 @@ static inline void mp_bd_decode_rle(uint32_t *dst, int dst_stride, int w, int h,
             // A marker following an implicit width wrap is a harmless no-op.
             // Otherwise it ends this line, including an empty line.
             if (!wrapped) {
+                uint32_t *out = dst + (size_t)dst_stride * y + x;
+                for (int i = x; i < w; i++)
+                    *out++ = 0;
                 x = 0;
                 y++;
             }
