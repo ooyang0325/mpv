@@ -591,9 +591,15 @@ static int init(struct ao *ao)
     }
 
     if (af_fmt_is_pcm(original_format) && !p->pcm_to_dsd_active) {
+        // Ordinary PCM (including exclusive PCM): keep OS mixing on, so overlays
+        // like Blu-ray menu sound effects may be mixed in safely.
+        ao->bit_exact = false;
         err = ca_enable_mixing(ao, p->device, true);
         CHECK_CA_WARN("failed to keep PCM mixing enabled");
     } else {
+        // DoP, PCM-to-DSD or any non-mixable carrier: the device output must
+        // stay bit-perfect, so mark the route so nothing gets mixed into it.
+        ao->bit_exact = true;
         err = ca_disable_mixing(ao, p->device, &p->changed_mixing);
         CHECK_CA_WARN("failed to disable mixing");
     }

@@ -64,6 +64,13 @@
 // Poll interval while waiting out a still frame, to avoid busy-spinning (ns).
 #define BLURAY_STILL_POLL_NS   (20 * 1000 * 1000)
 
+// Bound on authored menu sound effects buffered for the player. Rapid button
+// presses stay bounded: on overflow the oldest queued clip is dropped.
+#define BLURAY_MAX_PENDING_SFX 8
+
+// libbluray always authors sound effects as 48 kHz LPCM (see bd_sound_effect).
+#define BLURAY_SOUND_EFFECT_RATE 48000
+
 #define BLURAY_DEFAULT_ANGLE      0
 #define BLURAY_DEFAULT_CHAPTER    0
 #define BLURAY_PLAYLIST_TITLE    -3
@@ -145,6 +152,19 @@ struct bluray_priv_s {
     struct mp_nav_cmd *cmd_queue;
     int num_cmds;
     int mousex, mousey;
+
+    // Pending authored menu sound effects (BD_EVENT_SOUND_EFFECT). Copied out
+    // of libbluray on this (stream) thread and drained by the player through
+    // STREAM_CTRL_GET_NAV_SOUND. Bounded ring: a stalled consumer can never
+    // make this grow without limit. Each buffer is an independent talloc root
+    // so ownership can cross to the player thread without touching a shared
+    // parent. Protected by nav_lock.
+    struct bluray_pending_sfx {
+        int16_t *samples;        // owned talloc root; NULL when slot is empty
+        int num_frames;
+        int num_channels;
+    } sfx_queue[BLURAY_MAX_PENDING_SFX];
+    int sfx_head, sfx_count;
 
     struct mp_bluray_opts *opts;
     struct m_config_cache *opts_cache;
@@ -438,9 +458,55 @@ static void bluray_stream_close(stream_t *s)
         talloc_free(priv->pending_overlay);
         talloc_free(priv->cmd_queue);
         talloc_free(priv->pool);
+        for (int n = 0; n < BLURAY_MAX_PENDING_SFX; n++)
+            talloc_free(priv->sfx_queue[n].samples);
         mp_mutex_destroy(&priv->nav_lock);
     }
 }
+
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 9, 0)
+// Fetch an authored menu sound effect from libbluray (owned by the BLURAY* and
+// only valid to touch on this thread), copy its PCM into an independent buffer,
+// and queue it for the player. Runs on the stream/demux read thread.
+static void queue_sound_effect(stream_t *s, uint32_t id)
+{
+    struct bluray_priv_s *b = s->priv;
+
+    BLURAY_SOUND_EFFECT effect = {0};
+    // bd_get_sound_effect: <0 no effects at all, 0 id out of range, 1 success.
+    if (bd_get_sound_effect(b->bd, id, &effect) != 1)
+        return;
+    if (!effect.samples || effect.num_frames <= 0 ||
+        (effect.num_channels != 1 && effect.num_channels != 2))
+        return;
+
+    // Copy out of the library-owned buffer immediately: it is only valid until
+    // the next libbluray call. Use an independent talloc root so the player can
+    // take ownership across the thread boundary without racing on a shared
+    // parent context.
+    size_t n = (size_t)effect.num_frames * effect.num_channels;
+    int16_t *copy = talloc_array(NULL, int16_t, n);
+    memcpy(copy, effect.samples, n * sizeof(int16_t));
+
+    mp_mutex_lock(&b->nav_lock);
+    if (b->sfx_count >= BLURAY_MAX_PENDING_SFX) {
+        // Drop the oldest clip so button mashing stays bounded.
+        struct bluray_pending_sfx *old = &b->sfx_queue[b->sfx_head];
+        talloc_free(old->samples);
+        old->samples = NULL;
+        b->sfx_head = (b->sfx_head + 1) % BLURAY_MAX_PENDING_SFX;
+        b->sfx_count--;
+    }
+    int tail = (b->sfx_head + b->sfx_count) % BLURAY_MAX_PENDING_SFX;
+    b->sfx_queue[tail] = (struct bluray_pending_sfx){
+        .samples = copy,
+        .num_frames = effect.num_frames,
+        .num_channels = effect.num_channels,
+    };
+    b->sfx_count++;
+    mp_mutex_unlock(&b->nav_lock);
+}
+#endif
 
 static void handle_event(stream_t *s, const BD_EVENT *ev)
 {
@@ -519,6 +585,15 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
             mp_mutex_unlock(&b->nav_lock);
         }
         break;
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 9, 0)
+    case BD_EVENT_SOUND_EFFECT:
+        // Only navigation (menu) mode overlays authored effects. Direct title
+        // playback leaves audio untouched, and DVD menu sound is already
+        // carried in-band by the program stream.
+        if (b->use_nav)
+            queue_sound_effect(s, ev->param);
+        break;
+#endif
 #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 5, 0)
     case BD_EVENT_DISCONTINUITY:
         if (b->use_nav) {
@@ -827,6 +902,28 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         b->reset_pending = false;
         mp_mutex_unlock(&b->nav_lock);
         return pending ? STREAM_OK : STREAM_UNSUPPORTED;
+    }
+    case STREAM_CTRL_GET_NAV_SOUND: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        struct mp_nav_sound_effect *out = arg;
+        mp_mutex_lock(&b->nav_lock);
+        if (b->sfx_count <= 0) {
+            mp_mutex_unlock(&b->nav_lock);
+            return STREAM_UNSUPPORTED; // nothing queued
+        }
+        struct bluray_pending_sfx *e = &b->sfx_queue[b->sfx_head];
+        *out = (struct mp_nav_sound_effect){
+            .samples = e->samples, // transfer ownership to the caller
+            .num_frames = e->num_frames,
+            .num_channels = e->num_channels,
+            .rate = BLURAY_SOUND_EFFECT_RATE,
+        };
+        e->samples = NULL;
+        b->sfx_head = (b->sfx_head + 1) % BLURAY_MAX_PENDING_SFX;
+        b->sfx_count--;
+        mp_mutex_unlock(&b->nav_lock);
+        return STREAM_OK;
     }
     default:
         break;

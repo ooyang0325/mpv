@@ -99,6 +99,7 @@ enum stream_ctrl {
     STREAM_CTRL_GET_NAV_STATE,       // struct mp_nav_state_info* (read-only)
     STREAM_CTRL_GET_NAV_OVERLAY,     // struct mp_nav_overlay* (transfer ownership)
     STREAM_CTRL_GET_NAV_RESET,       // NULL; STREAM_OK if a demux reset is due
+    STREAM_CTRL_GET_NAV_SOUND,       // struct mp_nav_sound_effect* (transfer ownership)
 };
 
 struct stream_lang_req {

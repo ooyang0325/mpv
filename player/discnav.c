@@ -29,6 +29,8 @@
 #include "common/msg.h"
 #include "input/input.h"
 
+#include "audio/bd_sfx.h"
+
 #include "stream/stream.h"
 #include "stream/discnav.h"
 
@@ -84,6 +86,8 @@ static void apply_overlay(struct MPContext *mpctx)
 
 void mp_nav_destroy(struct MPContext *mpctx)
 {
+    talloc_free(mpctx->bd_sfx);
+    mpctx->bd_sfx = NULL;
     if (!mpctx->nav_state)
         return;
     osd_set_nav(mpctx->osd, NULL);
@@ -92,6 +96,21 @@ void mp_nav_destroy(struct MPContext *mpctx)
     mp_notify_property(mpctx, "disc-menu-active");
     mp_notify_property(mpctx, "disc-menu-popup-available");
     mp_notify_property(mpctx, "disc-mouse-on-button");
+}
+
+// Drain authored menu sound effects from the disc stream into the mixer. Runs
+// on the core thread, same as the mix point in ao_process, so the mixer needs
+// no locking. The stream itself copies the PCM out of libbluray on its own
+// thread; here we only ever receive owned buffers.
+static void fetch_sound_effects(struct MPContext *mpctx, struct stream *s)
+{
+    struct mp_nav_sound_effect e;
+    while (stream_control(s, STREAM_CTRL_GET_NAV_SOUND, &e) == STREAM_OK) {
+        if (!mpctx->bd_sfx)
+            mpctx->bd_sfx = mp_bd_sfx_create(mpctx, mpctx->log);
+        mp_bd_sfx_add(mpctx->bd_sfx, e.samples, e.num_frames, e.num_channels);
+        talloc_free(e.samples); // add() copies; release the transferred buffer
+    }
 }
 
 void mp_handle_nav(struct MPContext *mpctx)
@@ -145,6 +164,8 @@ void mp_handle_nav(struct MPContext *mpctx)
     // so overlay animations and hover feedback stay responsive.
     if (info.menu_active || info.overlay_visible || info.still_seconds)
         mp_set_timeout(mpctx, 0.05);
+
+    fetch_sound_effects(mpctx, s);
 }
 
 static enum mp_nav_action parse_action(const char *action)

@@ -47,6 +47,13 @@ struct ao {
     int init_flags; // AO_INIT_* flags
     bool stream_silence;        // if audio inactive, just play silence
 
+    // Set by drivers that carry PCM to the device bit-for-bit, where the output
+    // must stay bit-perfect and nothing may be mixed into it (Core Audio
+    // PCM-to-DSD, or a non-mixable exclusive/hog physical format). Ordinary
+    // mixable PCM - including exclusive PCM that keeps OS mixing - leaves this
+    // false. Read via ao_is_bit_exact().
+    bool bit_exact;
+
     // The device as selected by the user, usually using ao_device_desc.name
     // from an entry from the list returned by driver->list_devices. If the
     // default device should be used, this is set to NULL.

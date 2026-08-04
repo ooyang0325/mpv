@@ -93,6 +93,10 @@ void ao_get_format(struct ao *ao,
 const char *ao_get_name(struct ao *ao);
 const char *ao_get_description(struct ao *ao);
 bool ao_untimed(struct ao *ao);
+// True when the AO carries PCM to the device bit-for-bit, so nothing may be
+// mixed into the output (e.g. Core Audio PCM-to-DSD or a non-mixable exclusive
+// carrier). See struct ao.bit_exact.
+bool ao_is_bit_exact(struct ao *ao);
 int ao_control(struct ao *ao, enum aocontrol cmd, void *arg);
 void ao_set_gain(struct ao *ao, float gain);
 double ao_get_delay(struct ao *ao);

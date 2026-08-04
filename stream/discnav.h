@@ -67,6 +67,18 @@ struct mp_nav_cmd {
 #define MP_NAV_UO_MENU    (1u << 1) // menu call prohibited
 #define MP_NAV_UO_RESUME  (1u << 2) // resume/leave-menu prohibited
 
+// One authored menu sound effect handed from the disc stream to the player.
+// libbluray delivers these as short 48 kHz, 16-bit LPCM clips (mono or stereo,
+// interleaved) via BD_EVENT_SOUND_EFFECT; the producer copies the PCM out of
+// the library on its own thread and transfers ownership of `samples` to the
+// consumer. Retrieved via STREAM_CTRL_GET_NAV_SOUND (one clip per call).
+struct mp_nav_sound_effect {
+    int16_t *samples;    // owned by caller after fetch; talloc-freed by it
+    int num_frames;      // frames (not samples) in `samples`
+    int num_channels;    // 1 (mono) or 2 (stereo)
+    int rate;            // sample rate in Hz (always 48000 for Blu-ray)
+};
+
 // Overlay fetch result: bitmaps, their generation id and authored resolution,
 // retrieved together via STREAM_CTRL_GET_NAV_OVERLAY so the consumer can never
 // pair a bitmap generation with a mismatched change id or scaling size.

@@ -124,6 +124,13 @@ dop = executable('dop', files('dop.c'),
                  link_with: test_utils)
 test('dop', dop)
 
+bd_sfx = executable('bd-sfx', files('bd_sfx.c'),
+                    include_directories: incdir,
+                    objects: libmpv.extract_objects('audio/bd_sfx.c'),
+                    dependencies: [libavutil, libswresample],
+                    link_with: test_utils)
+test('bd-sfx', bd_sfx)
+
 format = executable('format', files('format.c'), include_directories: incdir, link_with: test_utils)
 test('format', format)
 

@@ -464,6 +464,11 @@ bool ao_untimed(struct ao *ao)
     return ao->untimed;
 }
 
+bool ao_is_bit_exact(struct ao *ao)
+{
+    return ao->bit_exact;
+}
+
 // ---
 
 struct ao_hotplug {

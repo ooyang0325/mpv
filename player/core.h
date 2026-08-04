@@ -263,6 +263,7 @@ typedef struct MPContext {
     struct mp_log *statusline;
     struct osd_state *osd;
     struct mp_nav_state *nav_state; // Blu-ray/disc menu navigation, or NULL
+    struct mp_bd_sfx *bd_sfx;       // authored Blu-ray menu sound-effect mixer, or NULL
     char *term_osd_text;
     char *term_osd_status;
     char *term_osd_subs[2];

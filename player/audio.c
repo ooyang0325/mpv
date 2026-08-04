@@ -30,6 +30,8 @@
 #include "common/common.h"
 #include "osdep/timer.h"
 
+#include "audio/aframe.h"
+#include "audio/bd_sfx.h"
 #include "audio/format.h"
 #include "audio/out/ao.h"
 #include "demux/demux.h"
@@ -760,6 +762,14 @@ static void ao_process(struct mp_filter *f)
             mp_wakeup_core(mpctx);
             MP_VERBOSE(mpctx, "previous audio still playing; continuing\n");
         }
+
+        // Overlay any authored Blu-ray menu sound effect onto the outgoing
+        // decoded PCM, reusing this frame's format/rate/channel map. The mixer
+        // suppresses itself on any bit-perfect route (passthrough, DoP,
+        // PCM-to-DSD, non-mixable exclusive); it is only ever non-NULL while a
+        // disc menu is navigating.
+        if (mpctx->bd_sfx)
+            mp_bd_sfx_mix(mpctx->bd_sfx, af, ao_c->ao && ao_is_bit_exact(ao_c->ao));
 
         mp_pin_in_write(ao_c->queue_filter->pins[0], frame);
     } else if (frame.type == MP_FRAME_EOF) {

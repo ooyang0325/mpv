@@ -63,6 +63,7 @@ features += {'r8brain': r8brain}
 sources = files(
     ## Audio
     'audio/aframe.c',
+    'audio/bd_sfx.c',
     'audio/chmap.c',
     'audio/chmap_avchannel.c',
     'audio/chmap_sel.c',
