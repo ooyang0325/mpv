@@ -164,13 +164,14 @@ static enum mp_nav_action parse_action(const char *action)
 }
 
 // Map window/OSD coordinates to authored overlay-plane coordinates (inverse of
-// osd_rescale_bitmaps()).
+// osd_rescale_bitmaps()). Uses the authored size paired with the currently
+// rendered overlay generation so clicks land on the buttons the user sees.
 static void window_to_authored(struct MPContext *mpctx, int wx, int wy,
                                int *ax, int *ay)
 {
     struct mp_nav_state *nav = mpctx->nav_state;
-    int fw = nav && nav->st.overlay_w > 0 ? nav->st.overlay_w : 1920;
-    int fh = nav && nav->st.overlay_h > 0 ? nav->st.overlay_h : 1080;
+    int fw = nav && nav->overlay_w > 0 ? nav->overlay_w : 1920;
+    int fh = nav && nav->overlay_h > 0 ? nav->overlay_h : 1080;
     struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
     int vidw = res.w - res.ml - res.mr;
     int vidh = res.h - res.mt - res.mb;

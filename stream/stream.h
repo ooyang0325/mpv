@@ -97,7 +97,7 @@ enum stream_ctrl {
     // Disc menu navigation (bluray:// menu mode)
     STREAM_CTRL_NAV_CMD,             // struct mp_nav_cmd* (player -> stream)
     STREAM_CTRL_GET_NAV_STATE,       // struct mp_nav_state_info* (read-only)
-    STREAM_CTRL_GET_NAV_OVERLAY,     // struct sub_bitmaps** (transfer ownership)
+    STREAM_CTRL_GET_NAV_OVERLAY,     // struct mp_nav_overlay* (transfer ownership)
     STREAM_CTRL_GET_NAV_RESET,       // NULL; STREAM_OK if a demux reset is due
 };
 

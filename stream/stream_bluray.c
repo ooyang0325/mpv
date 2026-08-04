@@ -564,18 +564,39 @@ static int bdnav_stream_fill_buffer(stream_t *s, void *buf, int len)
 
         BD_EVENT event;
         int read = bd_read_ext(b->bd, (unsigned char *)buf, len, &event);
-        if (read > 0)
-            return read;
         if (read < 0)
             return -1;
 
-        // read == 0: either an event needs handling or we're in a still/EOF.
-        if (event.event != BD_EVENT_NONE) {
+        // Always process a pending event, even when data was also returned, so
+        // menu-state changes and resets are never dropped. The nested demuxer's
+        // reset handshake (demux_disc) discards any packet that straddles the
+        // resulting transition.
+        if (event.event != BD_EVENT_NONE)
             handle_event(s, &event);
+
+        if (read > 0)
+            return read;
+
+        // read == 0: no data was produced this call.
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 9, 0)
+        if (event.event == BD_EVENT_IDLE) {
+            // Playlist is not playing but a title applet is running. libbluray
+            // explicitly asks not to call bd_read*() again immediately; back off
+            // so the demuxer read thread cannot busy-loop.
+            if (s->cancel && mp_cancel_test(s->cancel))
+                return 0;
+            mp_sleep_ns(BLURAY_STILL_POLL_NS);
+            still_start = 0;
+            continue;
+        }
+#endif
+        if (event.event != BD_EVENT_NONE) {
+            // Some other event was handled above; try reading again.
             still_start = 0;
             continue;
         }
 
+        // event == BD_EVENT_NONE: either a still frame or end of stream.
         mp_mutex_lock(&b->nav_lock);
         int still = b->still_length;
         mp_mutex_unlock(&b->nav_lock);
