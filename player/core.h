@@ -214,6 +214,10 @@ struct ao_chain {
 
     bool ao_underrun;   // last known AO state
     bool underrun;      // for cache pause logic
+
+    // True while we are synthesizing silence to drain a Blu-ray menu sound
+    // effect on a menu that has no program audio (see feed_menu_sfx_silence).
+    bool bd_sfx_feeding;
 };
 
 /* Note that playback can be paused, stopped, etc. at any time. While paused,

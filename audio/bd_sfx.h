@@ -72,6 +72,11 @@ void mp_bd_sfx_flush(struct mp_bd_sfx *sfx);
 // inspection and tests.
 int mp_bd_sfx_num_pending(struct mp_bd_sfx *sfx);
 
+// True while the mixer still has something to emit: a clip is being mixed or at
+// least one is queued. Used to decide whether to synthesize silence to drain an
+// effect on a menu with no program audio, and to bound that synthesis.
+bool mp_bd_sfx_has_output(struct mp_bd_sfx *sfx);
+
 // --- Pure helpers, unit-tested in isolation (no libbluray/AO/thread state) ---
 
 // True when overlaying decoded PCM effects is safe for this output route.

@@ -889,6 +889,87 @@ void audio_start_ao(struct MPContext *mpctx)
     mp_wakeup_core(mpctx);
 }
 
+// Drain a pending Blu-ray menu sound effect over synthesized silence when the
+// program itself is not feeding audio, so authored menu clicks are still
+// audible on a quiet/still menu. mp_bd_sfx_mix() otherwise only runs on real
+// decoded frames in ao_process(), and a silent menu produces none.
+//
+// This only ever does anything while a Blu-ray menu is navigating (bd_sfx set)
+// and a clip is pending, and only on an established, mixable PCM route. It never
+// fabricates audio when no output was negotiated (the cold-start limit), never
+// runs while the program is delivering audio (that path overlays effects
+// directly and must not be desynced), respects bit-exact suppression, and stops
+// as soon as the clip has drained (no continuous silence).
+static void feed_menu_sfx_silence(struct MPContext *mpctx)
+{
+    struct ao_chain *ao_c = mpctx->ao_chain;
+    struct mp_bd_sfx *sfx = mpctx->bd_sfx;
+    if (!sfx || !ao_c || !ao_c->ao || !ao_c->queue_filter)
+        return;
+
+    // Only step in when the program is not itself producing audio. In
+    // PLAYING/SYNCING/READY/DRAINING the normal ao_process() path overlays the
+    // effect on the flowing PCM; synthesizing here would displace or desync it.
+    bool quiet = mpctx->audio_status == STATUS_EOF;
+
+    if (quiet && mp_bd_sfx_has_output(sfx)) {
+        int rate = 0, format = 0;
+        struct mp_chmap chmap = {0};
+        ao_get_format(ao_c->ao, &rate, &format, &chmap);
+        // No negotiated PCM format yet: never invent a standalone output.
+        if (rate <= 0 || !mp_chmap_is_valid(&chmap))
+            return;
+        if (!mp_bd_sfx_route_allows_mix(format, ao_is_bit_exact(ao_c->ao))) {
+            mp_bd_sfx_flush(sfx);
+            return;
+        }
+
+        struct mp_pin *qpin = ao_c->queue_filter->pins[0];
+        bool wrote = false;
+        // Bounded: only produce chunks while the effect still has output, and
+        // never overflow the queue. A short clip fits entirely, so it plays back
+        // without a mid-clip underrun.
+        for (int guard = 0; guard < 1024 && mp_bd_sfx_has_output(sfx); guard++) {
+            if (!mp_pin_in_needs_data(qpin))
+                break; // queue full; resume on a later playloop iteration
+            struct mp_aframe *sil = mp_aframe_create();
+            mp_aframe_set_format(sil, format);
+            mp_aframe_set_rate(sil, rate);
+            mp_aframe_set_chmap(sil, &chmap);
+            if (!mp_aframe_alloc_data(sil, 2048)) {
+                talloc_free(sil);
+                break;
+            }
+            mp_aframe_set_silence(sil, 0, 2048);
+            mp_aframe_set_pts(sil, MP_NOPTS_VALUE);
+            mp_bd_sfx_mix(sfx, sil, ao_is_bit_exact(ao_c->ao));
+            mp_pin_in_write(qpin, MAKE_FRAME(MP_FRAME_AUDIO, sil));
+            wrote = true;
+        }
+        if (wrote) {
+            ao_c->bd_sfx_feeding = true;
+            ao_start(ao_c->ao);    // (re)engage; no-op if already running
+            mp_wakeup_core(mpctx); // come back to top up / stop promptly
+            return;
+        }
+    }
+
+    // Effect finished (or the program took audio back over): once the queued
+    // silence has actually played out, stop the AO so it does not keep padding
+    // silence indefinitely. Only touch the device in the quiet EOF state we own.
+    if (ao_c->bd_sfx_feeding) {
+        bool drained = !mp_bd_sfx_has_output(sfx) &&
+                       mp_async_queue_get_frames(ao_c->ao_queue) == 0 &&
+                       ao_get_delay(ao_c->ao) < 0.05;
+        if (!quiet) {
+            ao_c->bd_sfx_feeding = false; // program resumed; let the core own it
+        } else if (drained) {
+            ao_c->bd_sfx_feeding = false;
+            ao_reset(ao_c->ao);
+        }
+    }
+}
+
 void fill_audio_out_buffers(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -1004,6 +1085,11 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
 
     if (mpctx->restart_complete)
         audio_start_ao(mpctx); // in case it got delayed
+
+    // After the audio state has settled for this iteration, drain any pending
+    // Blu-ray menu sound effect over synthesized silence if the program is not
+    // itself feeding audio (quiet/still menu). No-op outside disc-menu playback.
+    feed_menu_sfx_silence(mpctx);
 }
 
 // Drop data queued for output, or which the AO is currently outputting.

@@ -126,7 +126,10 @@ test('dop', dop)
 
 bd_sfx = executable('bd-sfx', files('bd_sfx.c'),
                     include_directories: incdir,
-                    objects: libmpv.extract_objects('audio/bd_sfx.c'),
+                    objects: libmpv.extract_objects('audio/bd_sfx.c',
+                                                     'audio/aframe.c',
+                                                     'audio/chmap_avchannel.c',
+                                                     'audio/fmt-conversion.c'),
                     dependencies: [libavutil, libswresample],
                     link_with: test_utils)
 test('bd-sfx', bd_sfx)

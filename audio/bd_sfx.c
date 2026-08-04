@@ -87,6 +87,11 @@ int mp_bd_sfx_num_pending(struct mp_bd_sfx *sfx)
     return sfx->num_pending;
 }
 
+bool mp_bd_sfx_has_output(struct mp_bd_sfx *sfx)
+{
+    return sfx->active.pcm != NULL || sfx->num_pending > 0;
+}
+
 bool mp_bd_sfx_add(struct mp_bd_sfx *sfx, const int16_t *samples,
                    int num_frames, int num_channels)
 {
