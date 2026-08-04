@@ -1270,6 +1270,8 @@ void run_playloop(struct MPContext *mpctx)
     handle_vo_events(mpctx);
     handle_command_updates(mpctx);
 
+    mp_handle_nav(mpctx);
+
     if (mpctx->lavfi && mp_filter_has_failed(mpctx->lavfi))
         mpctx->stop_play = AT_END_OF_FILE;
 

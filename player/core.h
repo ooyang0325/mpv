@@ -262,6 +262,7 @@ typedef struct MPContext {
 
     struct mp_log *statusline;
     struct osd_state *osd;
+    struct mp_nav_state *nav_state; // Blu-ray/disc menu navigation, or NULL
     char *term_osd_text;
     char *term_osd_status;
     char *term_osd_subs[2];
@@ -641,6 +642,14 @@ void seek_to_last_frame(struct MPContext *mpctx);
 void update_screensaver_state(struct MPContext *mpctx);
 void update_ab_loop_clip(struct MPContext *mpctx);
 bool get_internal_paused(struct MPContext *mpctx);
+
+// discnav.c
+void mp_handle_nav(struct MPContext *mpctx);
+void mp_nav_user_input(struct MPContext *mpctx, const char *action);
+void mp_nav_destroy(struct MPContext *mpctx);
+bool mp_nav_menu_active(struct MPContext *mpctx);
+bool mp_nav_popup_available(struct MPContext *mpctx);
+bool mp_nav_mouse_on_button(struct MPContext *mpctx);
 
 // scripting.c
 struct mp_script_args {

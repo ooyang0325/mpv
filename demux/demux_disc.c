@@ -232,6 +232,15 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
 {
     struct priv *p = demuxer->priv;
 
+    // Disc menu navigation: when the outer stream (e.g. libbluray in menu mode)
+    // crosses a title/playlist boundary, re-sync the nested demuxer without
+    // recreating the stream, so the live navigation VM is preserved.
+    if (stream_control(demuxer->stream, STREAM_CTRL_GET_NAV_RESET, NULL) == STREAM_OK) {
+        if (p->slave->desc->drop_buffers)
+            p->slave->desc->drop_buffers(p->slave);
+        p->seek_reinit = true;
+    }
+
     struct demux_packet *pkt = demux_read_any_packet(p->slave);
     if (!pkt)
         return false;

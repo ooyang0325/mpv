@@ -3221,6 +3221,27 @@ static int mp_property_player_operation_mode(void *ctx, struct m_property *prop,
     return m_property_strdup_ro(action, arg, m_opt_choice_str(mode_names, mpctx->opts->operation_mode));
 }
 
+static int mp_property_disc_menu_active(void *ctx, struct m_property *prop,
+                                        int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    return m_property_bool_ro(action, arg, mp_nav_menu_active(mpctx));
+}
+
+static int mp_property_disc_menu_popup_available(void *ctx, struct m_property *prop,
+                                                 int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    return m_property_bool_ro(action, arg, mp_nav_popup_available(mpctx));
+}
+
+static int mp_property_disc_mouse_on_button(void *ctx, struct m_property *prop,
+                                            int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    return m_property_bool_ro(action, arg, mp_nav_mouse_on_button(mpctx));
+}
+
 static int mp_property_mouse_pos(void *ctx, struct m_property *prop,
                                     int action, void *arg)
 {
@@ -4790,6 +4811,10 @@ static const struct m_property mp_properties_base[] = {
     {"tablet-pos", mp_property_tablet_pos},
     {"dropped-files", mp_property_dropped_files},
 
+    {"disc-menu-active", mp_property_disc_menu_active},
+    {"disc-menu-popup-available", mp_property_disc_menu_popup_available},
+    {"disc-mouse-on-button", mp_property_disc_mouse_on_button},
+
     // Subs
     {"sid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_SUB}},
     {"secondary-sid", mp_property_switch_track,
@@ -5454,6 +5479,13 @@ fread_pic(FILE *fp, mp_image_t *dst, size_t bytesPerLine, size_t h, size_t strid
         }
     }
     return bytesRead == expectedBytes;
+}
+
+static void cmd_discnav(void *pcmd)
+{
+    struct mp_cmd_ctx *cmd = pcmd;
+    struct MPContext *mpctx = cmd->mpctx;
+    mp_nav_user_input(mpctx, cmd->args[0].v.s);
 }
 
 static void cmd_overlay_add(void *pcmd)
@@ -7938,6 +7970,8 @@ const struct mp_cmd_def mp_cmds[] = {
                                         {"dw", OPT_INT(v.i), OPTDEF_INT(0)},
                                         {"dh", OPT_INT(v.i), OPTDEF_INT(0)}, }},
     { "overlay-remove", cmd_overlay_remove, { {"id", OPT_INT(v.i)} } },
+
+    { "discnav", cmd_discnav, { {"action", OPT_STRING(v.s)} } },
 
     { "osd-overlay", cmd_osd_overlay,
         {

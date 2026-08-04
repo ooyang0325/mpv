@@ -191,6 +191,9 @@ static void kill_demuxers_reentrant(struct MPContext *mpctx,
 
 static void uninit_demuxer(struct MPContext *mpctx)
 {
+    // Clear any disc menu overlay and navigation state before the stream goes.
+    mp_nav_destroy(mpctx);
+
     for (int t = 0; t < STREAM_TYPE_COUNT; t++) {
         for (int r = 0; r < num_ptracks[t]; r++)
             mpctx->current_track[r][t] = NULL;

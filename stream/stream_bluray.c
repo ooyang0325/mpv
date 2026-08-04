@@ -41,17 +41,28 @@
 #include "mpv_talloc.h"
 #include "common/common.h"
 #include "common/msg.h"
+#include "misc/thread_tools.h"
 #include "options/m_config.h"
 #include "options/options.h"
 #include "options/path.h"
 #include "stream.h"
+#include "discnav.h"
+#include "bluray_overlay.h"
 #include "osdep/io.h"
 #include "osdep/timer.h"
+#include "osdep/threads.h"
 #include "sub/osd.h"
 #include "sub/img_convert.h"
 #include "video/mp_image.h"
+#include "video/mp_image_pool.h"
 
 #define BLURAY_SECTOR_SIZE     6144
+
+// Number of overlay planes (0: Presentation Graphics, 1: Interactive Graphics).
+#define BLURAY_NUM_OVERLAYS    2
+
+// Poll interval while waiting out a still frame, to avoid busy-spinning (ns).
+#define BLURAY_STILL_POLL_NS   (20 * 1000 * 1000)
 
 #define BLURAY_DEFAULT_ANGLE      0
 #define BLURAY_DEFAULT_CHAPTER    0
@@ -88,6 +99,14 @@ const struct m_sub_options stream_bluray_conf = {
     },
 };
 
+struct bluray_overlay_plane {
+    struct mp_image *image; // persistent premultiplied BGRA plane buffer
+    int x, y, w, h;         // authored position/size on the overlay plane
+    bool active;            // plane has been initialized
+    bool hidden;            // plane should not be displayed
+    bool has_content;       // something has been drawn since the last clear
+};
+
 struct bluray_priv_s {
     BLURAY *bd;
     BLURAY_TITLE_INFO *title_info;
@@ -99,6 +118,32 @@ struct bluray_priv_s {
     int cfg_title;
     int cfg_playlist;
     char *cfg_device;
+
+    // Navigation (menu) mode. Direct title/playlist playback leaves all of the
+    // following untouched.
+    bool use_nav;
+    struct mp_image_pool *pool;
+
+    // Overlay planes and published bitmaps. Planes are only ever touched on the
+    // demuxer read thread (inside the libbluray overlay callback / bd_read_ext).
+    struct bluray_overlay_plane planes[BLURAY_NUM_OVERLAYS];
+
+    // Shared state between the demuxer read thread and the player thread.
+    // Everything below is protected by nav_lock.
+    mp_mutex nav_lock;
+    struct sub_bitmaps *pending_overlay; // owned; handed to the player on demand
+    int overlay_change_id;
+    int overlay_w, overlay_h;
+    bool overlay_visible;
+    bool in_menu;
+    bool popup_available;
+    bool mouse_over_button;
+    uint32_t uo_mask;
+    int still_length;            // 0: none, -1: infinite, >0: seconds
+    bool reset_pending;          // nested demuxer should re-sync
+    struct mp_nav_cmd *cmd_queue;
+    int num_cmds;
+    int mousex, mousey;
 
     struct mp_bluray_opts *opts;
     struct m_config_cache *opts_cache;
@@ -114,6 +159,259 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
     return bd_select_title(priv->bd, title);
 }
 
+// ---- Disc menu navigation (menu mode only) -------------------------------
+
+static void overlay_plane_release(struct bluray_overlay_plane *plane)
+{
+    if (plane->image)
+        talloc_free(plane->image);
+    *plane = (struct bluray_overlay_plane){0};
+}
+
+static void overlay_plane_alloc(struct bluray_priv_s *b,
+                                struct bluray_overlay_plane *plane,
+                                int x, int y, int w, int h)
+{
+    overlay_plane_release(plane);
+    if (w < 1 || h < 1)
+        return;
+    struct mp_image *mpi = mp_image_pool_get(b->pool, IMGFMT_BGRA, w, h);
+    if (!mpi)
+        return;
+    mp_image_clear(mpi, 0, 0, w, h);
+    plane->image = mpi;
+    plane->x = x;
+    plane->y = y;
+    plane->w = w;
+    plane->h = h;
+    plane->active = true;
+    plane->hidden = false;
+    plane->has_content = false;
+}
+
+static void overlay_close_all(struct bluray_priv_s *b)
+{
+    for (int i = 0; i < BLURAY_NUM_OVERLAYS; i++)
+        overlay_plane_release(&b->planes[i]);
+}
+
+// Build a fresh sub_bitmaps snapshot (in authored coordinates) from the visible
+// planes, or NULL if nothing is visible. Runs on the demuxer read thread.
+static struct sub_bitmaps *build_overlay_bitmaps(struct bluray_priv_s *b,
+                                                 int change_id)
+{
+    int num = 0, packed_w = 0, packed_h = 0;
+    for (int i = 0; i < BLURAY_NUM_OVERLAYS; i++) {
+        struct bluray_overlay_plane *p = &b->planes[i];
+        if (p->active && p->image && !p->hidden && p->has_content) {
+            num++;
+            packed_w = MPMAX(packed_w, p->w);
+            packed_h += p->h;
+        }
+    }
+    if (!num)
+        return NULL;
+
+    struct mp_image *packed = mp_image_alloc(IMGFMT_BGRA, packed_w, packed_h);
+    if (!packed)
+        return NULL;
+    mp_image_clear(packed, 0, 0, packed_w, packed_h);
+
+    struct sub_bitmaps *res = talloc_zero(NULL, struct sub_bitmaps);
+    res->format = SUBBITMAP_BGRA;
+    res->change_id = change_id;
+    res->packed = talloc_steal(res, packed);
+    res->packed_w = packed_w;
+    res->packed_h = packed_h;
+    res->parts = talloc_array(res, struct sub_bitmap, num);
+
+    int y_off = 0, n = 0;
+    for (int i = 0; i < BLURAY_NUM_OVERLAYS; i++) {
+        struct bluray_overlay_plane *p = &b->planes[i];
+        if (!(p->active && p->image && !p->hidden && p->has_content))
+            continue;
+        uint8_t *dst = (uint8_t *)packed->planes[0] + y_off * packed->stride[0];
+        for (int y = 0; y < p->h; y++) {
+            memcpy(dst + y * packed->stride[0],
+                   (uint8_t *)p->image->planes[0] + y * p->image->stride[0],
+                   p->w * 4);
+        }
+        res->parts[n] = (struct sub_bitmap){
+            .bitmap = dst,
+            .stride = packed->stride[0],
+            .w = p->w, .h = p->h,
+            .dw = p->w, .dh = p->h,
+            .x = p->x, .y = p->y,
+            .src_x = 0, .src_y = y_off,
+        };
+        y_off += p->h;
+        n++;
+    }
+    res->num_parts = n;
+    return res;
+}
+
+// Publish the currently visible overlay to the player side.
+static void publish_overlay(struct bluray_priv_s *b)
+{
+    int w = 0, h = 0;
+    for (int i = 0; i < BLURAY_NUM_OVERLAYS; i++) {
+        if (b->planes[i].active) {
+            w = MPMAX(w, b->planes[i].x + b->planes[i].w);
+            h = MPMAX(h, b->planes[i].y + b->planes[i].h);
+        }
+    }
+
+    mp_mutex_lock(&b->nav_lock);
+    int id = ++b->overlay_change_id;
+    mp_mutex_unlock(&b->nav_lock);
+
+    struct sub_bitmaps *imgs = build_overlay_bitmaps(b, id);
+
+    mp_mutex_lock(&b->nav_lock);
+    talloc_free(b->pending_overlay);
+    b->pending_overlay = imgs;
+    b->overlay_visible = imgs != NULL;
+    if (w > 0 && h > 0) {
+        b->overlay_w = w;
+        b->overlay_h = h;
+    }
+    mp_mutex_unlock(&b->nav_lock);
+}
+
+static void overlay_process(void *data, const BD_OVERLAY *const bo)
+{
+    stream_t *s = data;
+    struct bluray_priv_s *b = s->priv;
+    if (!bo) {
+        overlay_close_all(b);
+        publish_overlay(b);
+        return;
+    }
+    if (bo->plane >= BLURAY_NUM_OVERLAYS)
+        return;
+    struct bluray_overlay_plane *plane = &b->planes[bo->plane];
+
+    switch (bo->cmd) {
+    case BD_OVERLAY_INIT:
+        overlay_plane_alloc(b, plane, bo->x, bo->y, bo->w, bo->h);
+        break;
+    case BD_OVERLAY_CLOSE:
+        overlay_plane_release(plane);
+        publish_overlay(b);
+        break;
+    case BD_OVERLAY_CLEAR:
+        if (plane->image) {
+            mp_image_clear(plane->image, 0, 0, plane->w, plane->h);
+            plane->has_content = false;
+        }
+        break;
+    case BD_OVERLAY_DRAW: {
+        if (!plane->image || !bo->img || !bo->palette)
+            break;
+        int stride_px = plane->image->stride[0] / 4;
+        uint32_t *origin = (uint32_t *)plane->image->planes[0];
+        uint32_t *dst = origin + stride_px * bo->y + bo->x;
+        mp_bd_decode_rle(dst, stride_px, bo->w, bo->h,
+                         (const struct mp_bd_palette_entry *)bo->palette,
+                         (const struct mp_bd_rle_elem *)bo->img);
+        plane->hidden = false;
+        plane->has_content = true;
+        break;
+    }
+    case BD_OVERLAY_WIPE: {
+        if (!plane->image)
+            break;
+        int stride_px = plane->image->stride[0] / 4;
+        uint32_t *origin = (uint32_t *)plane->image->planes[0];
+        for (int y = 0; y < bo->h; y++)
+            memset(origin + stride_px * (y + bo->y) + bo->x, 0, 4 * bo->w);
+        break;
+    }
+    case BD_OVERLAY_HIDE:
+        plane->hidden = true;
+        break;
+    case BD_OVERLAY_FLUSH:
+        publish_overlay(b);
+        break;
+    default:
+        break;
+    }
+}
+
+static bd_vk_key_e nav_action_to_vk(enum mp_nav_action action)
+{
+    switch (action) {
+    case MP_NAV_ACTION_UP:     return BD_VK_UP;
+    case MP_NAV_ACTION_DOWN:   return BD_VK_DOWN;
+    case MP_NAV_ACTION_LEFT:   return BD_VK_LEFT;
+    case MP_NAV_ACTION_RIGHT:  return BD_VK_RIGHT;
+    case MP_NAV_ACTION_SELECT: return BD_VK_ENTER;
+    default:                   return BD_VK_NONE;
+    }
+}
+
+// Apply a single navigation command. Runs on the demuxer read thread so that
+// the BLURAY* VM is only ever touched from one thread.
+static void apply_nav_command(struct bluray_priv_s *b, struct mp_nav_cmd *cmd)
+{
+    const int64_t pts = -1; // "current position"
+    bd_vk_key_e key = nav_action_to_vk(cmd->action);
+    if (key != BD_VK_NONE) {
+        bd_user_input(b->bd, pts, key);
+        return;
+    }
+    switch (cmd->action) {
+    case MP_NAV_ACTION_MENU:
+        bd_menu_call(b->bd, pts);
+        break;
+    case MP_NAV_ACTION_POPUP:
+        bd_user_input(b->bd, pts, BD_VK_POPUP);
+        break;
+    case MP_NAV_ACTION_MOUSE_MOVE: {
+        b->mousex = cmd->x;
+        b->mousey = cmd->y;
+        int over = bd_mouse_select(b->bd, pts, cmd->x, cmd->y);
+        mp_mutex_lock(&b->nav_lock);
+        b->mouse_over_button = over > 0;
+        mp_mutex_unlock(&b->nav_lock);
+        break;
+    }
+    case MP_NAV_ACTION_MOUSE_CLICK: {
+        b->mousex = cmd->x;
+        b->mousey = cmd->y;
+        int over = bd_mouse_select(b->bd, pts, cmd->x, cmd->y);
+        mp_mutex_lock(&b->nav_lock);
+        b->mouse_over_button = over > 0;
+        mp_mutex_unlock(&b->nav_lock);
+        bd_user_input(b->bd, pts, BD_VK_MOUSE_ACTIVATE);
+        break;
+    }
+    case MP_NAV_ACTION_RESUME:
+        // libbluray has no generic resume; best effort is to dismiss a popup.
+        if (b->popup_available)
+            bd_user_input(b->bd, pts, BD_VK_POPUP);
+        break;
+    default:
+        break;
+    }
+}
+
+// Drain and apply all queued navigation commands (demuxer read thread).
+static void drain_nav_commands(struct bluray_priv_s *b)
+{
+    mp_mutex_lock(&b->nav_lock);
+    struct mp_nav_cmd *queue = b->cmd_queue;
+    int num = b->num_cmds;
+    b->cmd_queue = NULL;
+    b->num_cmds = 0;
+    mp_mutex_unlock(&b->nav_lock);
+
+    for (int i = 0; i < num; i++)
+        apply_nav_command(b, &queue[i]);
+    talloc_free(queue);
+}
+
 static void bluray_stream_close(stream_t *s)
 {
     struct bluray_priv_s *priv = s->priv;
@@ -124,6 +422,13 @@ static void bluray_stream_close(stream_t *s)
         bd_free_title_info(priv->title_info);
     if (priv->bd)
         bd_close(priv->bd);
+    if (priv->use_nav) {
+        overlay_close_all(priv);
+        talloc_free(priv->pending_overlay);
+        talloc_free(priv->cmd_queue);
+        talloc_free(priv->pool);
+        mp_mutex_destroy(&priv->nav_lock);
+    }
 }
 
 static void handle_event(stream_t *s, const BD_EVENT *ev)
@@ -131,21 +436,47 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
     struct bluray_priv_s *b = s->priv;
     switch (ev->event) {
     case BD_EVENT_MENU:
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->in_menu = ev->param;
+            mp_mutex_unlock(&b->nav_lock);
+        }
         break;
     case BD_EVENT_STILL:
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->still_length = ev->param ? -1 : 0;
+            mp_mutex_unlock(&b->nav_lock);
+        }
         break;
     case BD_EVENT_STILL_TIME:
-        bd_read_skip_still(b->bd);
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->still_length = ev->param ? (int)ev->param : -1;
+            mp_mutex_unlock(&b->nav_lock);
+        } else {
+            bd_read_skip_still(b->bd);
+        }
         break;
     case BD_EVENT_END_OF_TITLE:
+        if (b->use_nav) {
+            overlay_close_all(b);
+            publish_overlay(b);
+        }
         break;
     case BD_EVENT_PLAYLIST:
         b->current_playlist = ev->param;
-        b->current_title = bd_get_current_title(b->bd);
+        if (!b->use_nav)
+            b->current_title = bd_get_current_title(b->bd);
         if (b->title_info)
             bd_free_title_info(b->title_info);
         b->title_info = bd_get_playlist_info(b->bd, b->current_playlist,
                                              b->current_angle);
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->reset_pending = true;
+            mp_mutex_unlock(&b->nav_lock);
+        }
         break;
     case BD_EVENT_TITLE:
         if (ev->param == BLURAY_TITLE_FIRST_PLAY) {
@@ -155,6 +486,11 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         if (b->title_info) {
             bd_free_title_info(b->title_info);
             b->title_info = NULL;
+        }
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->reset_pending = true;
+            mp_mutex_unlock(&b->nav_lock);
         }
         break;
     case BD_EVENT_ANGLE:
@@ -166,9 +502,28 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         }
         break;
     case BD_EVENT_POPUP:
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->popup_available = ev->param;
+            mp_mutex_unlock(&b->nav_lock);
+        }
         break;
 #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 5, 0)
     case BD_EVENT_DISCONTINUITY:
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->reset_pending = true;
+            mp_mutex_unlock(&b->nav_lock);
+        }
+        break;
+#endif
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(1, 0, 1)
+    case BD_EVENT_UO_MASK_CHANGED:
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->uo_mask = ev->param;
+            mp_mutex_unlock(&b->nav_lock);
+        }
         break;
 #endif
     default:
@@ -184,6 +539,59 @@ static int bluray_stream_fill_buffer(stream_t *s, void *buf, int len)
     while (bd_get_event(b->bd, &event))
         handle_event(s, &event);
     return bd_read(b->bd, buf, len);
+}
+
+static int bdnav_stream_fill_buffer(stream_t *s, void *buf, int len)
+{
+    struct bluray_priv_s *b = s->priv;
+    int64_t still_start = 0;
+    for (;;) {
+        drain_nav_commands(b);
+
+        BD_EVENT event;
+        int read = bd_read_ext(b->bd, (unsigned char *)buf, len, &event);
+        if (read > 0)
+            return read;
+        if (read < 0)
+            return -1;
+
+        // read == 0: either an event needs handling or we're in a still/EOF.
+        if (event.event != BD_EVENT_NONE) {
+            handle_event(s, &event);
+            still_start = 0;
+            continue;
+        }
+
+        mp_mutex_lock(&b->nav_lock);
+        int still = b->still_length;
+        mp_mutex_unlock(&b->nav_lock);
+
+        if (still != 0) {
+            if (s->cancel && mp_cancel_test(s->cancel))
+                return 0;
+            if (still > 0) {
+                // Timed still: keep the frame until the time elapses, then let
+                // libbluray continue.
+                if (!still_start)
+                    still_start = mp_time_ns();
+                if (mp_time_ns() - still_start >= (int64_t)still * 1000000000) {
+                    bd_read_skip_still(b->bd);
+                    mp_mutex_lock(&b->nav_lock);
+                    b->still_length = 0;
+                    mp_mutex_unlock(&b->nav_lock);
+                    still_start = 0;
+                    continue;
+                }
+            }
+            // Infinite still ends when a menu action turns it off; poll without
+            // busy-spinning.
+            mp_sleep_ns(BLURAY_STILL_POLL_NS);
+            continue;
+        }
+
+        // Genuine end of stream.
+        return 0;
+    }
 }
 
 static int bluray_stream_control(stream_t *s, int cmd, void *arg)
@@ -321,6 +729,53 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         *(char**)arg = talloc_strdup(NULL, meta->di_name);
         return STREAM_OK;
     }
+    case STREAM_CTRL_NAV_CMD: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        struct mp_nav_cmd *in = arg;
+        mp_mutex_lock(&b->nav_lock);
+        MP_TARRAY_APPEND(b, b->cmd_queue, b->num_cmds, *in);
+        mp_mutex_unlock(&b->nav_lock);
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_NAV_STATE: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        struct mp_nav_state_info *out = arg;
+        mp_mutex_lock(&b->nav_lock);
+        *out = (struct mp_nav_state_info){
+            .menu_active = b->in_menu,
+            .popup_available = b->popup_available,
+            .mouse_over_button = b->mouse_over_button,
+            .overlay_visible = b->overlay_visible,
+            .still_seconds = b->still_length,
+            .uo_mask = b->uo_mask,
+            .overlay_w = b->overlay_w,
+            .overlay_h = b->overlay_h,
+            .overlay_change_id = b->overlay_change_id,
+        };
+        mp_mutex_unlock(&b->nav_lock);
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_NAV_OVERLAY: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        struct sub_bitmaps **out = arg;
+        mp_mutex_lock(&b->nav_lock);
+        *out = b->pending_overlay; // transfer ownership
+        b->pending_overlay = NULL;
+        mp_mutex_unlock(&b->nav_lock);
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_NAV_RESET: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&b->nav_lock);
+        bool pending = b->reset_pending;
+        b->reset_pending = false;
+        mp_mutex_unlock(&b->nav_lock);
+        return pending ? STREAM_OK : STREAM_UNSUPPORTED;
+    }
     default:
         break;
     }
@@ -452,6 +907,12 @@ static int bluray_stream_open_internal(stream_t *s)
         goto err;
     }
 
+    b->use_nav = b->cfg_title == BLURAY_MENU_TITLE;
+    if (b->use_nav) {
+        mp_mutex_init(&b->nav_lock);
+        b->pool = mp_image_pool_new(b);
+    }
+
     /* check for available titles on disc */
     b->num_titles = bd_get_titles(bd, TITLES_RELEVANT, 0);
     if (!b->num_titles) {
@@ -485,14 +946,24 @@ static int bluray_stream_open_internal(stream_t *s)
     // initialize libbluray event queue
     bd_get_event(bd, NULL);
 
-    select_initial_title(s, bd_get_main_title(bd));
+    if (b->use_nav) {
+        if (!bd_play(bd)) {
+            MP_ERR(s, "Couldn't start Blu-ray navigation.\n");
+            ret = STREAM_ERROR;
+            goto err;
+        }
+        bd_register_overlay_proc(bd, s, overlay_process);
+    } else {
+        select_initial_title(s, bd_get_main_title(bd));
+    }
 
     if (!bd_select_angle(bd, b->opts->angle - 1))
         MP_WARN(s, "Couldn't select angle '%d'.\n", b->opts->angle - 1);
 
     b->current_angle = bd_get_current_angle(bd);
 
-    s->fill_buffer = bluray_stream_fill_buffer;
+    s->fill_buffer = b->use_nav ? bdnav_stream_fill_buffer
+                                : bluray_stream_fill_buffer;
     s->close       = bluray_stream_close;
     s->control     = bluray_stream_control;
     s->priv        = b;

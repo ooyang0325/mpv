@@ -96,6 +96,10 @@ test('json', json)
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 
+bluray_overlay = executable('bluray-overlay', files('bluray_overlay.c'),
+                            include_directories: incdir, link_with: test_utils)
+test('bluray-overlay', bluray_overlay)
+
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 
