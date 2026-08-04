@@ -165,6 +165,29 @@ static void test_menu_state(void)
     assert_false(mp_dvd_domain_changed(4, 4));
 }
 
+static void test_still_seconds(void)
+{
+    // Only 0xff is an infinite still; 0 means no wait; others are timed.
+    assert_int_equal(mp_dvd_still_seconds(0xff), -1);
+    assert_int_equal(mp_dvd_still_seconds(0), 0);
+    assert_int_equal(mp_dvd_still_seconds(1), 1);
+    assert_int_equal(mp_dvd_still_seconds(10), 10);
+}
+
+static void test_spu_wanted(void)
+{
+    // Non-subpicture substreams are never accumulated.
+    assert_false(mp_dvd_spu_wanted(-1, 0x1f));
+    assert_false(mp_dvd_spu_wanted(-1, 0x40));
+    // Unknown channel (-1) accepts any subpicture substream.
+    assert_true(mp_dvd_spu_wanted(-1, 0x20));
+    assert_true(mp_dvd_spu_wanted(-1, 0x3f));
+    // A known channel accepts only that channel.
+    assert_true(mp_dvd_spu_wanted(0x21, 0x21));
+    assert_false(mp_dvd_spu_wanted(0x21, 0x20));
+    assert_false(mp_dvd_spu_wanted(0x21, 0x22));
+}
+
 int main(void)
 {
     init_clut();
@@ -173,5 +196,7 @@ int main(void)
     test_decode();
     test_render_highlight();
     test_menu_state();
+    test_still_seconds();
+    test_spu_wanted();
     return 0;
 }

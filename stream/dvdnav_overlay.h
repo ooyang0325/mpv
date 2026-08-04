@@ -311,4 +311,24 @@ static inline bool mp_dvd_domain_changed(int old_domain, int new_domain)
     return old_domain != new_domain;
 }
 
+// Classify a DVDNAV_STILL_FRAME length. Only 0xff is an infinite still (park
+// until the user acts); a length of 0 means "no wait" (skip immediately); any
+// other value is a timed still in seconds. Returns -1 for infinite, otherwise
+// the length itself (0 = none).
+static inline int mp_dvd_still_seconds(int length)
+{
+    return length == 0xff ? -1 : length;
+}
+
+// Whether a demuxed private-stream-1 substream should be accumulated as the menu
+// subpicture. Only subpicture substreams (0x20..0x3f) qualify, and once the
+// active menu channel is known (>= 0) all other channels are ignored so
+// aspect-specific/multi-SPU menus render the selected channel only.
+static inline bool mp_dvd_spu_wanted(int want_substream, int substream)
+{
+    if (substream < 0x20 || substream > 0x3f)
+        return false;
+    return want_substream < 0 || substream == want_substream;
+}
+
 #endif // MP_DVDNAV_OVERLAY_H

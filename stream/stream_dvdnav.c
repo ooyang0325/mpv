@@ -90,6 +90,7 @@ struct priv {
     int spu_accum_len;
     int spu_want;            // target size of the unit being assembled
     int spu_sub;            // substream id of the unit being assembled
+    int spu_stream;          // active menu subpicture substream (0x20+phys, -1 any)
     struct mp_dvdspu spu;    // last fully decoded subpicture (spu.idx malloc'd)
     bool spu_valid;
     bool overlay_dirty;      // overlay needs to be rebuilt/published
@@ -109,6 +110,7 @@ struct priv {
     uint32_t uo_mask;
     int still_length;        // 0: none, -1: infinite, >0: seconds
     bool reset_pending;      // nested demuxer should re-sync
+    bool wait_pending;       // parked at a DVDNAV_WAIT sync point (drain first)
     struct mp_nav_cmd *cmd_queue;
     int num_cmds;
 
@@ -338,7 +340,9 @@ static void dvd_spu_accumulate(stream_t *s, int substream, bool has_pts,
                                const uint8_t *data, int len)
 {
     struct priv *p = s->priv;
-    if (substream < 0x20 || substream > 0x3f) // subpicture substreams only
+    // Only accumulate the active menu subpicture channel (blocker: ignore other
+    // 0x20..0x3f substreams so aspect-specific/multi-SPU menus stay correct).
+    if (!mp_dvd_spu_wanted(p->spu_stream, substream))
         return;
 
     if (has_pts) {
@@ -543,26 +547,30 @@ static void dvd_apply_nav_command(stream_t *s, struct mp_nav_cmd *cmd)
         p->overlay_dirty = true;
         break;
     case MP_NAV_ACTION_SELECT:
-        if (!uo.button_select_or_activate) {
+        // Only leave the authored still if the button was actually activated.
+        if (!uo.button_select_or_activate &&
+            dvdnav_button_activate(nav, pci) == DVDNAV_STATUS_OK) {
             p->activated = true;
-            dvdnav_button_activate(nav, pci);
             p->skip_still = true;
         }
         p->overlay_dirty = true;
         break;
-    case MP_NAV_ACTION_MENU:
-        if (!uo.root_menu_call && dvdnav_menu_call(nav, DVD_MENU_Root) != DVDNAV_STATUS_OK) {
-            if (!uo.title_menu_call)
-                dvdnav_menu_call(nav, DVD_MENU_Title);
-        }
-        p->skip_still = true;
+    case MP_NAV_ACTION_MENU: {
+        dvdnav_status_t st = DVDNAV_STATUS_ERR;
+        if (!uo.root_menu_call)
+            st = dvdnav_menu_call(nav, DVD_MENU_Root);
+        if (st != DVDNAV_STATUS_OK && !uo.title_menu_call)
+            st = dvdnav_menu_call(nav, DVD_MENU_Title);
+        if (st == DVDNAV_STATUS_OK)
+            p->skip_still = true;
         p->overlay_dirty = true;
         break;
+    }
     case MP_NAV_ACTION_POPUP:
         // DVD has no popup menu; treat it like opening the root menu.
-        if (!uo.root_menu_call)
-            dvdnav_menu_call(nav, DVD_MENU_Root);
-        p->skip_still = true;
+        if (!uo.root_menu_call &&
+            dvdnav_menu_call(nav, DVD_MENU_Root) == DVDNAV_STATUS_OK)
+            p->skip_still = true;
         p->overlay_dirty = true;
         break;
     case MP_NAV_ACTION_MOUSE_MOVE: {
@@ -578,18 +586,20 @@ static void dvd_apply_nav_command(stream_t *s, struct mp_nav_cmd *cmd)
     case MP_NAV_ACTION_MOUSE_CLICK:
         p->mousex = cmd->x;
         p->mousey = cmd->y;
-        if (!uo.button_select_or_activate) {
+        // A click outside any button must not skip the authored still:
+        // dvdnav_mouse_activate() only returns OK when it hit a button.
+        if (!uo.button_select_or_activate &&
+            dvdnav_mouse_activate(nav, pci, cmd->x, cmd->y) == DVDNAV_STATUS_OK) {
             p->activated = true;
-            dvdnav_mouse_activate(nav, pci, cmd->x, cmd->y);
             p->skip_still = true;
         }
         p->overlay_dirty = true;
         break;
     case MP_NAV_ACTION_RESUME:
         // Leave the menu / resume playback where possible.
-        if (!uo.resume)
-            dvdnav_menu_call(nav, DVD_MENU_Escape);
-        p->skip_still = true;
+        if (!uo.resume &&
+            dvdnav_menu_call(nav, DVD_MENU_Escape) == DVDNAV_STATUS_OK)
+            p->skip_still = true;
         p->overlay_dirty = true;
         break;
     default:
@@ -637,6 +647,17 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
             p->overlay_dirty = false;
         }
 
+        // Parked at a DVDNAV_WAIT sync point: feed no new data so the nested
+        // demuxer drains what it already buffered. demux_disc releases the wait
+        // (STREAM_CTRL_NAV_WAIT_DONE) once it has drained, and the live VM is
+        // preserved. Returning 0 here is not a real EOF; the stream layer keeps
+        // retrying fill_buffer.
+        mp_mutex_lock(&p->nav_lock);
+        bool waiting = p->wait_pending;
+        mp_mutex_unlock(&p->nav_lock);
+        if (waiting)
+            return 0;
+
         int len = -1, event = DVDNAV_NOP;
         if (dvdnav_get_next_block(nav, buf, &event, &len) != DVDNAV_STATUS_OK) {
             MP_ERR(s, "Error getting next block from DVD %d (%s)\n",
@@ -667,16 +688,19 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
             break;
         case DVDNAV_STILL_FRAME: {
             dvdnav_still_event_t *ev = (dvdnav_still_event_t *)buf;
-            int length = ev->length; // 0xff => infinite
+            int length = ev->length; // 0xff => infinite; 0 => no wait
+            bool infinite = length == 0xff;
             mp_mutex_lock(&p->nav_lock);
-            p->still_length = length == 0xff ? -1 : (length > 0 ? length : -1);
+            p->still_length = mp_dvd_still_seconds(length); // 0 none, -1 inf, >0 s
             mp_mutex_unlock(&p->nav_lock);
             if (p->overlay_dirty) {
                 dvd_publish_overlay(s);
                 p->overlay_dirty = false;
             }
 
-            if (p->skip_still) {
+            // A zero-length still must not park: skip it immediately. A user
+            // action (activate/menu/resume that succeeded) also ends the wait.
+            if (length == 0 || p->skip_still) {
                 p->skip_still = false;
                 dvdnav_still_skip(nav);
                 mp_mutex_lock(&p->nav_lock);
@@ -685,7 +709,7 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
                 still_start = 0;
                 break;
             }
-            if (length != 0xff && length > 0) {
+            if (!infinite) { // timed still (length > 0): wait it out, then skip
                 if (!still_start)
                     still_start = mp_time_ns();
                 if (mp_time_ns() - still_start >= (int64_t)length * 1000000000) {
@@ -697,15 +721,24 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
                     break;
                 }
             }
+            // Infinite (0xff) or a not-yet-elapsed timed still: poll without
+            // busy-spinning until the time elapses or the user acts.
             if (s->cancel && mp_cancel_test(s->cancel))
                 return 0;
             mp_sleep_ns(DVD_STILL_POLL_NS);
             break;
         }
         case DVDNAV_WAIT:
-            dvdnav_wait_skip(nav);
+            // Timing-critical sync point: do NOT skip immediately while the
+            // nested demuxer/decoder still has buffered data. Park (feed no new
+            // data) so the buffered playback drains; demux_disc releases the
+            // wait via STREAM_CTRL_NAV_WAIT_DONE once drained, preserving the
+            // live VM.
+            mp_mutex_lock(&p->nav_lock);
+            p->wait_pending = true;
+            mp_mutex_unlock(&p->nav_lock);
             still_start = 0;
-            break;
+            return 0;
         case DVDNAV_HIGHLIGHT:
             p->activated = false;
             p->overlay_dirty = true;
@@ -716,11 +749,20 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
             p->spu_clut_valid = true;
             p->overlay_dirty = true;
             break;
-        case DVDNAV_SPU_STREAM_CHANGE:
-            // A different subpicture stream is active now: drop any half-built
-            // unit so we never mix menus.
-            dvd_reset_spu(p);
+        case DVDNAV_SPU_STREAM_CHANGE: {
+            // Record the active physical subpicture channel now (the event
+            // payload aliases the block buffer and is only valid until the next
+            // dvdnav_get_next_block()). Resolve the aspect-correct physical
+            // stream via the API, falling back to the event's wide channel.
+            dvdnav_spu_stream_change_event_t *ev =
+                (dvdnav_spu_stream_change_event_t *)buf;
+            int phys = dvdnav_get_active_spu_stream(nav);
+            if (phys < 0)
+                phys = ev->physical_wide;
+            p->spu_stream = (phys >= 0 && phys <= 31) ? 0x20 + phys : -1;
+            dvd_reset_spu(p); // stale half-built unit belongs to the old channel
             break;
+        }
         case DVDNAV_AUDIO_STREAM_CHANGE:
             break;
         case DVDNAV_VTS_CHANGE: {
@@ -729,6 +771,7 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
                             dvdnav_is_domain_vtsm(nav) > 0 ? 2 :
                             dvdnav_is_domain_vmgm(nav) > 0 ? 1 : 0;
             dvd_reset_spu(p);
+            p->spu_stream = -1; // unknown until the next SPU_STREAM_CHANGE
             p->activated = false;
             if (!p->had_initial_vts) {
                 // dvdnav emits an initial VTS change before any data; don't ask
@@ -766,6 +809,7 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
         }
         case DVDNAV_HOP_CHANNEL:
             dvd_reset_spu(p);
+            p->spu_stream = -1; // resolved again on the next SPU_STREAM_CHANGE
             mp_mutex_lock(&p->nav_lock);
             p->reset_pending = true;
             mp_mutex_unlock(&p->nav_lock);
@@ -1086,6 +1130,21 @@ static int control(stream_t *stream, int cmd, void *arg)
         mp_mutex_unlock(&priv->nav_lock);
         return pending ? STREAM_OK : STREAM_UNSUPPORTED;
     }
+    case STREAM_CTRL_NAV_WAIT_DONE: {
+        // demux_disc calls this after the nested demuxer has drained. Only then
+        // do we let libdvdnav continue past the DVDNAV_WAIT sync point. The live
+        // dvdnav_t VM is preserved. Runs on the demuxer read thread.
+        if (!priv->use_nav)
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&priv->nav_lock);
+        bool waiting = priv->wait_pending;
+        priv->wait_pending = false;
+        mp_mutex_unlock(&priv->nav_lock);
+        if (!waiting)
+            return STREAM_UNSUPPORTED;
+        dvdnav_wait_skip(priv->dvdnav);
+        return STREAM_OK;
+    }
     }
 
     return STREAM_UNSUPPORTED;
@@ -1206,6 +1265,7 @@ static int open_s_internal(stream_t *stream)
         priv->use_nav = true;
         priv->cur_domain = -1;
         priv->spu_sub = -1;
+        priv->spu_stream = -1;
         mp_mutex_init(&priv->nav_lock);
         dvd_update_video_res(priv);
         MP_VERBOSE(stream, "DVD menu navigation enabled\n");
