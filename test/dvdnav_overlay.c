@@ -220,6 +220,18 @@ static void test_wait_phase(void)
     assert_int_equal(2, mp_nav_wait_phase(true, true));
 }
 
+static void test_demux_drained(void)
+{
+    // Threaded: the demuxer reports underrun once its queues run dry.
+    assert_true(mp_nav_demux_drained(true, 4096));
+    // Unthreaded (--demuxer-thread=no): underrun is forced false, so fall back
+    // to the thread-independent empty-forward-queue signal.
+    assert_true(mp_nav_demux_drained(false, 0));
+    assert_false(mp_nav_demux_drained(false, 4096));
+    // Both signals agree at the drain boundary.
+    assert_true(mp_nav_demux_drained(true, 0));
+}
+
 int main(void)
 {
     init_clut();
@@ -232,5 +244,6 @@ int main(void)
     test_spu_wanted();
     test_wait_drained();
     test_wait_phase();
+    test_demux_drained();
     return 0;
 }

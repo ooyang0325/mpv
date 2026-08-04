@@ -69,6 +69,16 @@ static inline int mp_nav_wait_phase(bool wait_pending, bool wait_release)
     return wait_release ? 2 : 1;
 }
 
+// Thread-independent "the nested demux queues are drained" test for the
+// DVDNAV_WAIT release. demux_reader_state.underrun is forced false when the
+// demuxer runs unthreaded (--demuxer-thread=no), so an empty forward queue
+// (fw_bytes == 0, which is thread-independent) also counts as drained. Pure/
+// inline for testing.
+static inline bool mp_nav_demux_drained(bool demux_underrun, int64_t fw_bytes)
+{
+    return demux_underrun || fw_bytes == 0;
+}
+
 // User input actions: player/client -> stream.
 // Delivered via STREAM_CTRL_NAV_CMD.
 enum mp_nav_action {

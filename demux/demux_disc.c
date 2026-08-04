@@ -317,12 +317,28 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
     if (!pkt) {
         // The slave read may have hit a DVDNAV_WAIT: the outer stream returned 0
         // (EOF to libavformat) but that is a navigation sync point, not real EOF.
-        // Keep the demuxer alive so the player can present the buffered data and
-        // then release the wait; we resume reading once cleared (above).
         int w = nav_wait_state(demuxer);
         if (w != 0) {
-            p->in_nav_wait = true;
-            p->nav_wait_recover = 0;
+            if (demux_is_threaded(demuxer)) {
+                // Threaded: keep the demuxer alive (no EOF) so the player can
+                // present the already-buffered packets and drain to the WAIT
+                // boundary; the playloop releases the wait once its FIFOs drain,
+                // then we recover and resume reading (top of this function).
+                p->in_nav_wait = true;
+                p->nav_wait_recover = 0;
+                return true;
+            }
+            // Unthreaded (--demuxer-thread=no): the player drives this read in a
+            // synchronous loop and cannot drain asynchronously, so "no packet,
+            // not EOF" would spin forever (demux_read_packet_async_until()) and
+            // reader_state.underrun is forced false. Take the explicit
+            // non-threaded release path here: the drained slave queue *is* the
+            // boundary, and the already-decoded output FIFOs still present in
+            // order, so release now (not on a timer), recover, and read the
+            // post-WAIT block on the next pass.
+            stream_control(demuxer->stream, STREAM_CTRL_NAV_WAIT_DONE, NULL);
+            nav_recover_slave(demuxer);
+            p->nav_wait_recover = 256;
             return true;
         }
         // Just resumed after a WAIT: demux_read_any_packet() returns NULL on the

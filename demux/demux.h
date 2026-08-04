@@ -332,6 +332,9 @@ void demux_set_ts_offset(struct demuxer *demuxer, double offset);
 // demux_disc to resume the same stream after a disc navigation WAIT sync point.
 void demux_lavf_clear_eof(struct demuxer *demuxer);
 
+// Whether the demuxer runs its own reader thread (--demuxer-thread=yes).
+bool demux_is_threaded(struct demuxer *demuxer);
+
 void demux_get_bitrate_stats(struct demuxer *demuxer, double *rates);
 void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *r);
 
