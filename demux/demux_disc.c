@@ -265,18 +265,6 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
         pkt = demux_read_any_packet(p->slave);
     }
 
-    // The nested demuxer produced no packet. If the outer DVD VM is parked at a
-    // DVDNAV_WAIT sync point, the buffered nested-demux data has now drained;
-    // release the wait (preserving the live VM), re-sync, and read the post-wait
-    // data. Otherwise this is a genuine end of stream.
-    if (!pkt &&
-        stream_control(demuxer->stream, STREAM_CTRL_NAV_WAIT_DONE, NULL)
-            == STREAM_OK)
-    {
-        nav_flush_slave(demuxer);
-        pkt = demux_read_any_packet(p->slave);
-    }
-
     if (!pkt)
         return false;
 

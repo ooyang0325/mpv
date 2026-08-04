@@ -764,6 +764,14 @@ static void handle_update_cache(struct MPContext *mpctx)
     if (!is_low)
         mpctx->demux_underrun = false;
 
+    // A disc menu / still keeps the disc stream intentionally idle while it waits
+    // for user input: the demuxer produces no packets, but this is not a real
+    // cache underrun. Don't enter the buffering pause for it, which would freeze
+    // an authored still menu behind a "Buffering..." state. Navigation input is
+    // still delivered to the stream, which resumes the VM when the user acts.
+    if (need_wait && mp_nav_hold_active(mpctx))
+        need_wait = false;
+
     if (mpctx->paused_for_cache != need_wait) {
         mpctx->paused_for_cache = need_wait;
         update_internal_pause_state(mpctx);

@@ -212,6 +212,17 @@ bool mp_nav_menu_active(struct MPContext *mpctx)
     return mpctx->nav_state && mpctx->nav_state->st.menu_active;
 }
 
+// True while a disc menu or still is on screen, i.e. the disc stream is
+// intentionally idle waiting for user input rather than starved. The player
+// uses this to avoid entering the cache-buffering pause, which would otherwise
+// freeze an authored still menu behind a "Buffering..." state (the demuxer
+// legitimately produces no packets until the user navigates).
+bool mp_nav_hold_active(struct MPContext *mpctx)
+{
+    struct mp_nav_state *nav = mpctx->nav_state;
+    return nav && (nav->st.menu_active || nav->st.still_seconds != 0);
+}
+
 bool mp_nav_popup_available(struct MPContext *mpctx)
 {
     return mpctx->nav_state && mpctx->nav_state->st.popup_available;
