@@ -135,6 +135,7 @@ struct bluray_priv_s {
     int overlay_change_id;
     int overlay_w, overlay_h;
     bool overlay_visible;
+    bool ig_visible;             // Interactive Graphics (menu) plane is on screen
     bool in_menu;
     bool popup_available;
     bool mouse_over_button;
@@ -265,6 +266,13 @@ static void publish_overlay(struct bluray_priv_s *b)
         }
     }
 
+    // The Interactive Graphics plane carries the HDMV button menu. Treat it as
+    // an active menu whenever it is visibly drawn, independent of BD_EVENT_MENU
+    // (which is not always emitted on a title -> Top Menu transition). The
+    // Presentation Graphics plane (subtitles) must not count as a menu.
+    struct bluray_overlay_plane *ig = &b->planes[BD_OVERLAY_IG];
+    bool ig_visible = ig->active && ig->image && !ig->hidden && ig->has_content;
+
     struct sub_bitmaps *imgs = build_overlay_bitmaps(b);
 
     mp_mutex_lock(&b->nav_lock);
@@ -274,6 +282,7 @@ static void publish_overlay(struct bluray_priv_s *b)
     talloc_free(b->pending_overlay);
     b->pending_overlay = imgs;
     b->overlay_visible = imgs != NULL;
+    b->ig_visible = ig_visible;
     if (w > 0 && h > 0) {
         b->overlay_w = w;
         b->overlay_h = h;
@@ -779,7 +788,10 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         struct mp_nav_state_info *out = arg;
         mp_mutex_lock(&b->nav_lock);
         *out = (struct mp_nav_state_info){
-            .menu_active = b->in_menu,
+            // The IG plane being on screen counts as an active menu even if
+            // BD_EVENT_MENU was not (yet) delivered, so callers can route arrow
+            // keys to the menu instead of seeking.
+            .menu_active = b->in_menu || b->ig_visible,
             .popup_available = b->popup_available,
             .mouse_over_button = b->mouse_over_button,
             .overlay_visible = b->overlay_visible,
