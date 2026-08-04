@@ -223,14 +223,31 @@ static void test_wait_phase(void)
 static void test_nav_hold(void)
 {
     // Held while a button menu is on screen (still, motion or WAIT-parked): the
-    // player idles audio and suppresses the cache pause here.
+    // player suppresses the cache pause here.
     assert_true(mp_nav_hold(true, 0));
     // Held on any authored still even without buttons (infinite or timed).
     assert_true(mp_nav_hold(false, -1));
     assert_true(mp_nav_hold(false, 5));
-    // Not held while content plays (no menu, no still) -> audio stays selected,
-    // so menu intros/animations and titles keep their audio.
+    // Not held while content plays (no menu, no still).
     assert_false(mp_nav_hold(false, 0));
+}
+
+static void test_nav_audio_idle(void)
+{
+    // A genuinely silent hold idles the audio output: a button menu, an
+    // indefinite or timed still, or a WAIT with no program audio.
+    assert_true(mp_nav_audio_idle(true, 0, false, false));   // silent button menu
+    assert_true(mp_nav_audio_idle(false, -1, false, false)); // indefinite still
+    assert_true(mp_nav_audio_idle(false, 5, false, false));  // timed still
+    assert_true(mp_nav_audio_idle(false, 0, true, false));   // silent WAIT
+    // A hold that carries authored in-band audio (motion menu / still with
+    // background music) must keep playing -- do NOT idle.
+    assert_false(mp_nav_audio_idle(true, 0, false, true));   // menu + program audio
+    assert_false(mp_nav_audio_idle(false, -1, false, true)); // still + program audio
+    assert_false(mp_nav_audio_idle(false, 0, true, true));   // WAIT + program audio
+    // Not held at all -> never idle, regardless of audio.
+    assert_false(mp_nav_audio_idle(false, 0, false, false));
+    assert_false(mp_nav_audio_idle(false, 0, false, true));
 }
 
 static void test_demux_drained(void)
@@ -258,6 +275,7 @@ int main(void)
     test_wait_drained();
     test_wait_phase();
     test_nav_hold();
+    test_nav_audio_idle();
     test_demux_drained();
     return 0;
 }

@@ -81,14 +81,26 @@ static inline bool mp_nav_demux_drained(bool demux_underrun, int64_t fw_bytes)
 
 // Whether the disc is "held" at a menu or still, i.e. intentionally parked
 // waiting for the user rather than actively playing content. The player uses
-// this to suppress the cache-buffering pause (an authored still produces no
-// packets until the user acts) and to idle the audio output: a button menu or
-// still is silent, so keeping the ao device open renders silence indefinitely,
-// pinning a CoreAudio render thread near 100% CPU and preventing a DVDNAV_WAIT
-// audio drain. Pure/inline for testing. still_seconds: 0 none, -1 inf, >0 timed.
+// this to suppress the cache-buffering pause: an authored still/menu produces
+// no packets until the user acts, and that must not be mistaken for a cache
+// underrun. Pure/inline for testing. still_seconds: 0 none, -1 inf, >0 timed.
 static inline bool mp_nav_hold(bool menu_active, int still_seconds)
 {
     return menu_active || still_seconds != 0;
+}
+
+// Whether the player should idle (deselect) the audio output during a disc
+// hold. A silent hold -- a still, or a WAIT-parked/looping button menu with no
+// program (in-band) audio -- otherwise keeps the audio device open rendering
+// silence for the whole (often indefinite) hold, pinning a CoreAudio render
+// thread near 100% CPU and preventing the DVDNAV_WAIT audio drain. But a motion
+// menu (or still) that carries authored background music must keep playing, so
+// idle only when there is genuinely no program audio. Pure/inline for testing.
+static inline bool mp_nav_audio_idle(bool menu_active, int still_seconds,
+                                     bool wait_pending, bool has_program_audio)
+{
+    bool hold = menu_active || still_seconds != 0 || wait_pending;
+    return hold && !has_program_audio;
 }
 
 // User input actions: player/client -> stream.

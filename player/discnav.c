@@ -31,12 +31,20 @@
 
 #include "audio/bd_sfx.h"
 
+#include "filters/f_async_queue.h"
+
 #include "stream/stream.h"
 #include "stream/discnav.h"
 
 #include "demux/demux.h"
 
 #include "sub/osd.h"
+
+// Poll iterations the audio output must stay starved during a disc hold before
+// we idle it, so a brief gap in authored menu music (or the initial buffered
+// audio draining at menu entry) does not deselect a motion menu's audio. Holds
+// poll at ~50ms, so this is a few hundred ms of confirmed silence.
+#define NAV_AUDIO_IDLE_DEBOUNCE 8
 
 struct mp_nav_state {
     struct mp_log *log;
@@ -46,7 +54,8 @@ struct mp_nav_state {
     struct sub_bitmaps *authored; // owned, in authored coords, for re-scaling
     int overlay_w, overlay_h;     // authored size paired with `authored`
     struct mp_osd_res last_res;
-    bool audio_idled;             // we deselected audio while parked on a still
+    bool audio_idled;             // we deselected audio during a silent hold
+    int audio_quiet_polls;        // consecutive polls the hold has been silent
 };
 
 // Return the disc stream if the current demuxer is a disc menu stream
@@ -142,24 +151,36 @@ void mp_handle_nav(struct MPContext *mpctx)
     if (old.mouse_over_button != info.mouse_over_button)
         mp_notify_property(mpctx, "disc-mouse-on-button");
 
-    // A DVD button menu (still or motion/WAIT-parked) and a plain authored still
-    // are silent, or should be treated as such while the user is parked at them.
-    // Deselect audio while the menu/still is on screen so the audio output device
-    // idles: otherwise the ao keeps its device open rendering silence for the
-    // whole (often indefinite) hold, which pins a CoreAudio render thread near
-    // 100% CPU. Worse, that churning silent ao never lets the audio FIFO drain to
-    // a DVDNAV_WAIT boundary, so a menu that parks via WAIT deadlocks. The ao is
-    // player-owned, so the demuxer cannot idle it -- this has to live here. This
-    // matches mp_nav_hold_active(): audio plays through menu intros/animations
-    // (no buttons yet) and is reselected when a title starts. Trade-off: a rare
-    // motion menu with authored background music is muted while its buttons show.
-    bool hold = mp_nav_hold(info.menu_active, info.still_seconds);
-    if (hold && !nav->audio_idled) {
+    // Idle the audio output only during a *genuinely silent* disc hold. A DVD
+    // still, or a WAIT-parked / looping button menu with no program audio,
+    // otherwise keeps the audio device open rendering silence for the whole
+    // (often indefinite) hold, pinning a CoreAudio render thread near 100% CPU
+    // and blocking the DVDNAV_WAIT audio drain; deselecting the audio track
+    // idles the device. But a motion menu (or still) that carries authored
+    // in-band background music must keep playing, so only idle once the audio
+    // output has actually been starved (no program audio) for a short debounce,
+    // and reselect the default track when the hold ends. Audio still plays
+    // through menu intros/animations (no hold yet) and titles. The AO is
+    // player-owned, so this has to live here.
+    // "Program audio" here means audio actually being produced for playback:
+    // the audio output chain exists and has decoded frames queued for it. This
+    // is the decoded-audio buffer feeding the AO, so it reflects real in-band
+    // audio regardless of the output device streaming silence when starved
+    // (a CoreAudio pull device keeps "playing", so its underrun flag is not a
+    // reliable silence signal). A silent hold drains this queue to empty.
+    bool has_program_audio = mpctx->ao_chain &&
+        mp_async_queue_get_frames(mpctx->ao_chain->ao_queue) > 0;
+    bool want_idle = mp_nav_audio_idle(info.menu_active, info.still_seconds,
+                                       info.wait_pending, has_program_audio);
+    nav->audio_quiet_polls = want_idle ? nav->audio_quiet_polls + 1 : 0;
+    if (want_idle && !nav->audio_idled &&
+        nav->audio_quiet_polls >= NAV_AUDIO_IDLE_DEBOUNCE)
+    {
         if (mpctx->current_track[0][STREAM_AUDIO]) {
             mp_switch_track(mpctx, STREAM_AUDIO, NULL, 0);
             nav->audio_idled = true;
         }
-    } else if (!hold && nav->audio_idled) {
+    } else if (!want_idle && nav->audio_idled) {
         nav->audio_idled = false;
         if (!mpctx->current_track[0][STREAM_AUDIO]) {
             struct track *want = select_default_track(mpctx, 0, STREAM_AUDIO);
