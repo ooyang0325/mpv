@@ -42,6 +42,7 @@ struct mp_nav_state {
     struct mp_nav_state_info st; // last polled snapshot (also read by properties)
     int applied_overlay_change_id;
     struct sub_bitmaps *authored; // owned, in authored coords, for re-scaling
+    int overlay_w, overlay_h;     // authored size paired with `authored`
     struct mp_osd_res last_res;
 };
 
@@ -58,22 +59,23 @@ static struct stream *get_nav_stream(struct MPContext *mpctx)
     return demuxer->stream;
 }
 
-// Rescale the cached authored overlay to the current OSD resolution and push it.
+// Rescale the cached authored overlay to the current OSD resolution and push it
+// to the dedicated disc-nav OSD source (never the public overlay-add slot).
 static void apply_overlay(struct MPContext *mpctx)
 {
     struct mp_nav_state *nav = mpctx->nav_state;
     if (!nav->authored || !nav->authored->num_parts) {
-        osd_set_external2(mpctx->osd, NULL);
+        osd_set_nav(mpctx->osd, NULL);
         return;
     }
     struct sub_bitmaps *imgs = sub_bitmaps_copy(NULL, nav->authored);
     if (!imgs)
         return;
-    int fw = nav->st.overlay_w > 0 ? nav->st.overlay_w : 1920;
-    int fh = nav->st.overlay_h > 0 ? nav->st.overlay_h : 1080;
+    int fw = nav->overlay_w > 0 ? nav->overlay_w : 1920;
+    int fh = nav->overlay_h > 0 ? nav->overlay_h : 1080;
     struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
     osd_rescale_bitmaps(imgs, fw, fh, res, 0);
-    osd_set_external2(mpctx->osd, imgs);
+    osd_set_nav(mpctx->osd, imgs);
     talloc_free(imgs);
 }
 
@@ -81,7 +83,7 @@ void mp_nav_destroy(struct MPContext *mpctx)
 {
     if (!mpctx->nav_state)
         return;
-    osd_set_external2(mpctx->osd, NULL);
+    osd_set_nav(mpctx->osd, NULL);
     talloc_free(mpctx->nav_state);
     mpctx->nav_state = NULL;
     mp_notify_property(mpctx, "disc-menu-active");
@@ -119,11 +121,16 @@ void mp_handle_nav(struct MPContext *mpctx)
 
     struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
     if (info.overlay_change_id != nav->applied_overlay_change_id) {
-        struct sub_bitmaps *imgs = NULL;
-        stream_control(s, STREAM_CTRL_GET_NAV_OVERLAY, &imgs);
+        // Fetch bitmaps, their generation id and authored size together, and
+        // trust the fetched id: a publish between the state poll and this fetch
+        // cannot leave us applying a mismatched generation.
+        struct mp_nav_overlay ov = {0};
+        stream_control(s, STREAM_CTRL_GET_NAV_OVERLAY, &ov);
         talloc_free(nav->authored);
-        nav->authored = talloc_steal(nav, imgs); // may be NULL
-        nav->applied_overlay_change_id = info.overlay_change_id;
+        nav->authored = talloc_steal(nav, ov.imgs); // may be NULL
+        nav->overlay_w = ov.w;
+        nav->overlay_h = ov.h;
+        nav->applied_overlay_change_id = ov.change_id;
         apply_overlay(mpctx);
         nav->last_res = res;
     } else if (nav->authored && !osd_res_equals(res, nav->last_res)) {

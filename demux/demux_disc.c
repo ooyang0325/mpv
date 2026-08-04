@@ -228,20 +228,43 @@ static void reset_pts(demuxer_t *demuxer)
     p->seek_reinit = false;
 }
 
+static bool nav_reset_pending(struct demuxer *demuxer)
+{
+    return stream_control(demuxer->stream, STREAM_CTRL_GET_NAV_RESET, NULL)
+                == STREAM_OK;
+}
+
+static void nav_flush_slave(struct demuxer *demuxer)
+{
+    struct priv *p = demuxer->priv;
+    if (p->slave->desc->drop_buffers)
+        p->slave->desc->drop_buffers(p->slave);
+    p->seek_reinit = true;
+}
+
 static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt)
 {
     struct priv *p = demuxer->priv;
 
     // Disc menu navigation: when the outer stream (e.g. libbluray in menu mode)
     // crosses a title/playlist boundary, re-sync the nested demuxer without
-    // recreating the stream, so the live navigation VM is preserved.
-    if (stream_control(demuxer->stream, STREAM_CTRL_GET_NAV_RESET, NULL) == STREAM_OK) {
-        if (p->slave->desc->drop_buffers)
-            p->slave->desc->drop_buffers(p->slave);
-        p->seek_reinit = true;
-    }
+    // recreating the stream, so the live navigation VM is preserved. A reset
+    // may have been flagged during a previous read.
+    bool reset = nav_reset_pending(demuxer);
+    if (reset)
+        nav_flush_slave(demuxer);
 
     struct demux_packet *pkt = demux_read_any_packet(p->slave);
+
+    // The transition event is emitted by the stream *during* the read above, so
+    // the packet we just got straddles the boundary. Drop it and re-read once
+    // (no loop) after flushing, so only post-transition data is exposed.
+    if (!reset && nav_reset_pending(demuxer)) {
+        nav_flush_slave(demuxer);
+        talloc_free(pkt);
+        pkt = demux_read_any_packet(p->slave);
+    }
+
     if (!pkt)
         return false;
 

@@ -15,6 +15,8 @@ enum mp_osdtype {
     OSDTYPE_EXTERNAL,
     OSDTYPE_EXTERNAL2,
 
+    OSDTYPE_NAV, // disc menu navigation overlay (dedicated source)
+
     OSDTYPE_COUNT
 };
 
@@ -44,7 +46,7 @@ struct osd_object {
     struct osd_external **externals;
     int num_externals;
 
-    // OSDTYPE_EXTERNAL2
+    // OSDTYPE_EXTERNAL2 and OSDTYPE_NAV (both hold external bitmap sources)
     struct sub_bitmaps *external2;
 
     // VO cache state

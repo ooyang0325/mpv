@@ -60,4 +60,13 @@ struct mp_nav_cmd {
     int x, y; // authored (overlay-plane) coordinates for mouse actions
 };
 
+// Overlay fetch result: bitmaps, their generation id and authored resolution,
+// retrieved together via STREAM_CTRL_GET_NAV_OVERLAY so the consumer can never
+// pair a bitmap generation with a mismatched change id or scaling size.
+struct mp_nav_overlay {
+    struct sub_bitmaps *imgs; // owned by caller after fetch; NULL clears/none
+    int change_id;            // generation of imgs (and of the current overlay)
+    int w, h;                 // authored overlay-plane resolution for scaling
+};
+
 #endif // MP_STREAM_DISCNAV_H

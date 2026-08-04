@@ -985,6 +985,29 @@ OSD Commands
     Remove an overlay added with ``overlay-add`` and the same ID. Does nothing
     if no overlay with this ID exists.
 
+``discnav <action>``
+    Send a navigation action to the disc menu of a Blu-ray opened in menu mode
+    (``bd://menu``, or the ``bluray://menu`` alias). The menu overlay is rendered
+    on a dedicated OSD source that does not interfere with ``overlay-add``. Does
+    nothing if the current file is not a disc in navigation mode.
+
+    ``<action>`` is one of:
+
+    ``up``, ``down``, ``left``, ``right``
+        Move the button selection.
+    ``select``
+        Activate the selected button.
+    ``menu`` or ``top-menu``
+        Open the disc top/root menu.
+    ``popup``
+        Toggle the popup menu.
+    ``mouse-move``, ``mouse-click``
+        Move the pointer to / click at the current mouse position (mapped from
+        window to authored video coordinates). ``mouse`` is an alias for
+        ``mouse-click``.
+    ``resume``
+        Leave the menu / resume playback if the disc allows it (best effort).
+
 ``osd-overlay``
     Add/update/remove an OSD overlay.
 
@@ -3162,6 +3185,19 @@ Property list
     representing the memory address of the D3D11 swapchain. May not always be
     available, i.e d3d11-output-mode is not set to ``composition`` or the VO
     does not support it.
+
+``disc-menu-active``
+    Read-only - ``yes`` while an interactive Blu-ray disc menu (HDMV) is on
+    screen for a disc opened in menu mode (``bd://menu``). Use the ``discnav``
+    command to interact with it.
+
+``disc-menu-popup-available``
+    Read-only - ``yes`` if a popup menu can currently be toggled with
+    ``discnav popup`` on a disc opened in menu mode.
+
+``disc-mouse-on-button``
+    Read-only - ``yes`` if the last mouse position mapped onto a selectable disc
+    menu button. Useful for switching the mouse cursor shape over disc menus.
 
 ``mouse-pos``
     Read-only - last known mouse position, normalized to OSD dimensions.

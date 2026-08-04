@@ -197,8 +197,9 @@ static void overlay_close_all(struct bluray_priv_s *b)
 
 // Build a fresh sub_bitmaps snapshot (in authored coordinates) from the visible
 // planes, or NULL if nothing is visible. Runs on the demuxer read thread.
-static struct sub_bitmaps *build_overlay_bitmaps(struct bluray_priv_s *b,
-                                                 int change_id)
+// change_id is filled in by the caller under nav_lock so that the published
+// generation id and the bitmaps stay in lockstep.
+static struct sub_bitmaps *build_overlay_bitmaps(struct bluray_priv_s *b)
 {
     int num = 0, packed_w = 0, packed_h = 0;
     for (int i = 0; i < BLURAY_NUM_OVERLAYS; i++) {
@@ -219,7 +220,6 @@ static struct sub_bitmaps *build_overlay_bitmaps(struct bluray_priv_s *b,
 
     struct sub_bitmaps *res = talloc_zero(NULL, struct sub_bitmaps);
     res->format = SUBBITMAP_BGRA;
-    res->change_id = change_id;
     res->packed = talloc_steal(res, packed);
     res->packed_w = packed_w;
     res->packed_h = packed_h;
@@ -251,7 +251,10 @@ static struct sub_bitmaps *build_overlay_bitmaps(struct bluray_priv_s *b,
     return res;
 }
 
-// Publish the currently visible overlay to the player side.
+// Publish the currently visible overlay to the player side. The bitmaps are
+// built outside the lock (planes are demuxer-thread only), but the change id,
+// bitmaps, visibility and authored size are stored together under nav_lock so a
+// consumer can never observe a bumped id without the matching bitmaps/size.
 static void publish_overlay(struct bluray_priv_s *b)
 {
     int w = 0, h = 0;
@@ -262,13 +265,12 @@ static void publish_overlay(struct bluray_priv_s *b)
         }
     }
 
+    struct sub_bitmaps *imgs = build_overlay_bitmaps(b);
+
     mp_mutex_lock(&b->nav_lock);
     int id = ++b->overlay_change_id;
-    mp_mutex_unlock(&b->nav_lock);
-
-    struct sub_bitmaps *imgs = build_overlay_bitmaps(b, id);
-
-    mp_mutex_lock(&b->nav_lock);
+    if (imgs)
+        imgs->change_id = id;
     talloc_free(b->pending_overlay);
     b->pending_overlay = imgs;
     b->overlay_visible = imgs != NULL;
@@ -510,6 +512,18 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         break;
 #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 5, 0)
     case BD_EVENT_DISCONTINUITY:
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            b->reset_pending = true;
+            mp_mutex_unlock(&b->nav_lock);
+        }
+        break;
+#endif
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 6, 0)
+    case BD_EVENT_PLAYLIST_STOP:
+    case BD_EVENT_SEEK:
+        // Both cross a media boundary within the same navigation session and
+        // require the nested demuxer to flush and re-sync.
         if (b->use_nav) {
             mp_mutex_lock(&b->nav_lock);
             b->reset_pending = true;
@@ -760,10 +774,15 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
     case STREAM_CTRL_GET_NAV_OVERLAY: {
         if (!b->use_nav)
             return STREAM_UNSUPPORTED;
-        struct sub_bitmaps **out = arg;
+        struct mp_nav_overlay *out = arg;
         mp_mutex_lock(&b->nav_lock);
-        *out = b->pending_overlay; // transfer ownership
+        // Bitmaps, their generation id and the authored size are read together
+        // so the consumer applies a self-consistent generation.
+        out->imgs = b->pending_overlay; // transfer ownership
         b->pending_overlay = NULL;
+        out->change_id = b->overlay_change_id;
+        out->w = b->overlay_w;
+        out->h = b->overlay_h;
         mp_mutex_unlock(&b->nav_lock);
         return STREAM_OK;
     }
@@ -947,12 +966,20 @@ static int bluray_stream_open_internal(stream_t *s)
     bd_get_event(bd, NULL);
 
     if (b->use_nav) {
-        if (!bd_play(bd)) {
-            MP_ERR(s, "Couldn't start Blu-ray navigation.\n");
-            ret = STREAM_ERROR;
-            goto err;
+        if (bd_play(bd)) {
+            bd_register_overlay_proc(bd, s, overlay_process);
+        } else {
+            // Authored navigation couldn't start (e.g. BD-J-only disc). Fall
+            // back to direct main-title playback instead of failing the open.
+            MP_WARN(s, "Couldn't start Blu-ray navigation; "
+                       "falling back to direct title playback.\n");
+            b->use_nav = false;
+            mp_mutex_destroy(&b->nav_lock);
+            talloc_free(b->pool);
+            b->pool = NULL;
+            b->cfg_title = BLURAY_DEFAULT_TITLE;
+            select_initial_title(s, bd_get_main_title(bd));
         }
-        bd_register_overlay_proc(bd, s, overlay_process);
     } else {
         select_initial_title(s, bd_get_main_title(bd));
     }

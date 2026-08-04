@@ -105,10 +105,31 @@ static void test_rle_overlong_run(void)
     assert_int_equal(buf[2], white);
 }
 
+static void test_rle_end_of_line(void)
+{
+    struct mp_bd_palette_entry pal[256] = {0};
+    pal[0] = (struct mp_bd_palette_entry){0, 128, 128, 0};     // transparent
+    pal[1] = (struct mp_bd_palette_entry){235, 128, 128, 255}; // opaque white
+    uint32_t white = conv(235, 128, 128, 255);
+
+    // A zero-length run acts as an end-of-line marker: it must fill the rest of
+    // the row with its (here transparent) color rather than loop forever.
+    uint32_t buf[4];
+    for (int i = 0; i < 4; i++)
+        buf[i] = 0xDEADBEEF;
+    struct mp_bd_rle_elem rle[] = { {2, 1}, {0, 0} };
+    mp_bd_decode_rle(buf, 4, 4, 1, pal, rle);
+    assert_int_equal(buf[0], white);
+    assert_int_equal(buf[1], white);
+    assert_int_equal(buf[2], 0);
+    assert_int_equal(buf[3], 0);
+}
+
 int main(void)
 {
     test_palette();
     test_rle_decode();
     test_rle_overlong_run();
+    test_rle_end_of_line();
     return 0;
 }
