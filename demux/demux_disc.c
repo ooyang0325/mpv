@@ -21,6 +21,7 @@
 
 #include "common/common.h"
 #include "common/msg.h"
+#include "osdep/timer.h"
 
 #include "stream/stream.h"
 #include "video/mp_image.h"
@@ -43,6 +44,8 @@ struct priv {
     double base_dts;    // packet DTS that maps to base_time
     double last_dts;    // DTS of previously demuxed packet
     bool seek_reinit;   // needs reinit after seek
+    bool in_nav_wait;   // parked at a DVDNAV_WAIT drain handshake (no slave read)
+    int nav_wait_recover; // >0: pumping the slave for the first post-WAIT packet
 
     bool is_dvd, is_cdda;
 };
@@ -242,9 +245,55 @@ static void nav_flush_slave(struct demuxer *demuxer)
     p->seek_reinit = true;
 }
 
+// Query the disc stream's DVDNAV_WAIT phase: 0 none, 1 waiting (player still
+// draining), 2 released (player drained, VM may continue). The poll also lets
+// the stream service menu input and republish a dirty highlight overlay on this
+// (the read) thread, so a long WAIT menu stays responsive.
+static int nav_wait_state(struct demuxer *demuxer)
+{
+    int st = 0;
+    if (stream_control(demuxer->stream, STREAM_CTRL_GET_NAV_WAIT, &st) != STREAM_OK)
+        return 0;
+    return st;
+}
+
+// Resume the slave after a WAIT: the outer stream returned 0 (EOF) so lavf would
+// flush its buffered packets into the player cache without trapping this thread
+// mid-read. That transient EOF latches at three levels -- the AVIO
+// (eof_reached), and the slave demuxer's in->eof and in->reading (which gates
+// read_packet). Clear the AVIO EOF (without seeking) and re-enable reading, so
+// the next read resumes the very same stream and drives dvdnav_wait_skip() from
+// the stream's own read thread. The single live navigation VM is untouched.
+static void nav_recover_slave(struct demuxer *demuxer)
+{
+    struct priv *p = demuxer->priv;
+    if (p->slave->desc && p->slave->desc->name &&
+        strcmp(p->slave->desc->name, "lavf") == 0)
+        demux_lavf_clear_eof(p->slave);
+    demux_start_prefetch(p->slave); // re-enable in->reading after the transient EOF
+}
+
 static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt)
 {
     struct priv *p = demuxer->priv;
+
+    // DVDNAV_WAIT drain handshake (see stream_dvdnav.c). While the disc VM is
+    // parked at a WAIT, the outer stream yields no data and the slave's AVIO is
+    // at a transient EOF. Report "no packet, not EOF" so the demuxer stays alive
+    // and the player can present the already-buffered packets and drain to the
+    // WAIT boundary -- without this thread being trapped in the outer stream's
+    // read (which starved the VO). Don't read the slave until the player
+    // releases us; then clear the slave EOF and resume the same stream.
+    if (p->in_nav_wait) {
+        int w = nav_wait_state(demuxer);
+        if (w == 1) {
+            mp_sleep_ns(MP_TIME_MS_TO_NS(10));
+            return true; // *out_pkt stays NULL: retry after the player drains
+        }
+        p->in_nav_wait = false;
+        p->nav_wait_recover = 256; // pump the slave for the first post-WAIT packet
+        nav_recover_slave(demuxer);
+    }
 
     // Disc menu navigation: when the outer stream (e.g. libbluray in menu mode)
     // crosses a title/playlist boundary, re-sync the nested demuxer without
@@ -265,8 +314,29 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
         pkt = demux_read_any_packet(p->slave);
     }
 
-    if (!pkt)
+    if (!pkt) {
+        // The slave read may have hit a DVDNAV_WAIT: the outer stream returned 0
+        // (EOF to libavformat) but that is a navigation sync point, not real EOF.
+        // Keep the demuxer alive so the player can present the buffered data and
+        // then release the wait; we resume reading once cleared (above).
+        int w = nav_wait_state(demuxer);
+        if (w != 0) {
+            p->in_nav_wait = true;
+            p->nav_wait_recover = 0;
+            return true;
+        }
+        // Just resumed after a WAIT: demux_read_any_packet() returns NULL on the
+        // call that merely *queues* the first post-WAIT packet (its all-eof
+        // snapshot predates the read). Retry (not EOF) so that packet surfaces;
+        // bounded so a genuine post-WAIT EOF still terminates playback.
+        if (p->nav_wait_recover > 0) {
+            p->nav_wait_recover--;
+            mp_sleep_ns(MP_TIME_MS_TO_NS(2));
+            return true;
+        }
         return false;
+    }
+    p->nav_wait_recover = 0; // got real data; done recovering
 
     demux_update(p->slave, MP_NOPTS_VALUE);
 

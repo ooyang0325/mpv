@@ -56,6 +56,19 @@ static inline bool mp_nav_wait_drained(bool demux_empty,
     return (!have_audio || audio_drained) && (!have_video || video_drained);
 }
 
+// DVDNAV_WAIT handshake phase reported by the stream to the nested demuxer
+// (STREAM_CTRL_GET_NAV_WAIT), so the demuxer can keep itself alive without EOF
+// while the player drains, then resume once released. Pure/inline for testing.
+//   0 = no wait outstanding
+//   1 = waiting (player still draining to the WAIT boundary)
+//   2 = released (player drained; the stream may run dvdnav_wait_skip and resume)
+static inline int mp_nav_wait_phase(bool wait_pending, bool wait_release)
+{
+    if (!wait_pending)
+        return 0;
+    return wait_release ? 2 : 1;
+}
+
 // User input actions: player/client -> stream.
 // Delivered via STREAM_CTRL_NAV_CMD.
 enum mp_nav_action {

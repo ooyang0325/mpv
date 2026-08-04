@@ -209,6 +209,17 @@ static void test_wait_drained(void)
     assert_false(mp_nav_wait_drained(true, true, false, true, true));
 }
 
+static void test_wait_phase(void)
+{
+    // No wait outstanding -> phase 0 regardless of the release flag.
+    assert_int_equal(0, mp_nav_wait_phase(false, false));
+    assert_int_equal(0, mp_nav_wait_phase(false, true));
+    // Waiting, not yet released by the player -> phase 1 (keep demuxer alive).
+    assert_int_equal(1, mp_nav_wait_phase(true, false));
+    // Waiting and released -> phase 2 (stream may wait_skip and resume).
+    assert_int_equal(2, mp_nav_wait_phase(true, true));
+}
+
 int main(void)
 {
     init_clut();
@@ -220,5 +231,6 @@ int main(void)
     test_still_seconds();
     test_spu_wanted();
     test_wait_drained();
+    test_wait_phase();
     return 0;
 }

@@ -101,6 +101,7 @@ enum stream_ctrl {
     STREAM_CTRL_GET_NAV_RESET,       // NULL; STREAM_OK if a demux reset is due
     STREAM_CTRL_GET_NAV_SOUND,       // struct mp_nav_sound_effect* (transfer ownership)
     STREAM_CTRL_NAV_WAIT_DONE,       // NULL; player says its pipeline has drained
+    STREAM_CTRL_GET_NAV_WAIT,        // int* out: 0 none / 1 waiting / 2 released
 };
 
 struct stream_lang_req {

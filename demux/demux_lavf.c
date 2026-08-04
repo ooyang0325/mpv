@@ -1806,6 +1806,23 @@ static void demux_drop_buffers_lavf(demuxer_t *demuxer)
     reset_dovi_split_state(demuxer);
 }
 
+// Clear a transient EOF on the underlying AVIO without seeking or dropping the
+// read position. The disc wrapper (demux_disc) uses this to resume reading the
+// very same stream after a navigation WAIT sync point: there the stream reports
+// EOF (a 0-byte read) so libavformat flushes its already-parsed packets into the
+// player cache without the read thread being trapped mid-read, but more data
+// follows from the same position once the player has drained to that boundary.
+// A real seek (as demux_drop_buffers_lavf does) would be wrong here -- the live
+// navigation VM has no linear byte position to seek to.
+void demux_lavf_clear_eof(demuxer_t *demuxer)
+{
+    lavf_priv_t *priv = demuxer->priv;
+    if (!priv || !priv->avfc || !priv->avfc->pb)
+        return;
+    priv->avfc->pb->eof_reached = 0;
+    priv->avfc->pb->error = 0;
+}
+
 static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
 {
     lavf_priv_t *priv = demuxer->priv;

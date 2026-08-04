@@ -328,6 +328,10 @@ void demux_flush(struct demuxer *demuxer);
 int demux_seek(struct demuxer *demuxer, double rel_seek_secs, int flags);
 void demux_set_ts_offset(struct demuxer *demuxer, double offset);
 
+// Clear a transient EOF on a libavformat demuxer's AVIO without seeking. Used by
+// demux_disc to resume the same stream after a disc navigation WAIT sync point.
+void demux_lavf_clear_eof(struct demuxer *demuxer);
+
 void demux_get_bitrate_stats(struct demuxer *demuxer, double *rates);
 void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *r);
 
