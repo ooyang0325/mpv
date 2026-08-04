@@ -46,6 +46,7 @@ struct mp_nav_state {
     struct sub_bitmaps *authored; // owned, in authored coords, for re-scaling
     int overlay_w, overlay_h;     // authored size paired with `authored`
     struct mp_osd_res last_res;
+    bool audio_idled;             // we deselected audio while parked on a still
 };
 
 // Return the disc stream if the current demuxer is a disc menu stream
@@ -140,6 +141,32 @@ void mp_handle_nav(struct MPContext *mpctx)
         mp_notify_property(mpctx, "disc-menu-popup-available");
     if (old.mouse_over_button != info.mouse_over_button)
         mp_notify_property(mpctx, "disc-mouse-on-button");
+
+    // A DVD button menu (still or motion/WAIT-parked) and a plain authored still
+    // are silent, or should be treated as such while the user is parked at them.
+    // Deselect audio while the menu/still is on screen so the audio output device
+    // idles: otherwise the ao keeps its device open rendering silence for the
+    // whole (often indefinite) hold, which pins a CoreAudio render thread near
+    // 100% CPU. Worse, that churning silent ao never lets the audio FIFO drain to
+    // a DVDNAV_WAIT boundary, so a menu that parks via WAIT deadlocks. The ao is
+    // player-owned, so the demuxer cannot idle it -- this has to live here. This
+    // matches mp_nav_hold_active(): audio plays through menu intros/animations
+    // (no buttons yet) and is reselected when a title starts. Trade-off: a rare
+    // motion menu with authored background music is muted while its buttons show.
+    bool hold = mp_nav_hold(info.menu_active, info.still_seconds);
+    if (hold && !nav->audio_idled) {
+        if (mpctx->current_track[0][STREAM_AUDIO]) {
+            mp_switch_track(mpctx, STREAM_AUDIO, NULL, 0);
+            nav->audio_idled = true;
+        }
+    } else if (!hold && nav->audio_idled) {
+        nav->audio_idled = false;
+        if (!mpctx->current_track[0][STREAM_AUDIO]) {
+            struct track *want = select_default_track(mpctx, 0, STREAM_AUDIO);
+            if (want)
+                mp_switch_track(mpctx, STREAM_AUDIO, want, 0);
+        }
+    }
 
     struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
     if (info.overlay_change_id != nav->applied_overlay_change_id) {
@@ -241,7 +268,7 @@ bool mp_nav_menu_active(struct MPContext *mpctx)
 bool mp_nav_hold_active(struct MPContext *mpctx)
 {
     struct mp_nav_state *nav = mpctx->nav_state;
-    return nav && (nav->st.menu_active || nav->st.still_seconds != 0);
+    return nav && mp_nav_hold(nav->st.menu_active, nav->st.still_seconds);
 }
 
 // True while the disc stream is parked at a DVDNAV_WAIT sync point waiting for

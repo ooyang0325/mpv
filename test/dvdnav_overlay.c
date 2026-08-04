@@ -220,6 +220,19 @@ static void test_wait_phase(void)
     assert_int_equal(2, mp_nav_wait_phase(true, true));
 }
 
+static void test_nav_hold(void)
+{
+    // Held while a button menu is on screen (still, motion or WAIT-parked): the
+    // player idles audio and suppresses the cache pause here.
+    assert_true(mp_nav_hold(true, 0));
+    // Held on any authored still even without buttons (infinite or timed).
+    assert_true(mp_nav_hold(false, -1));
+    assert_true(mp_nav_hold(false, 5));
+    // Not held while content plays (no menu, no still) -> audio stays selected,
+    // so menu intros/animations and titles keep their audio.
+    assert_false(mp_nav_hold(false, 0));
+}
+
 static void test_demux_drained(void)
 {
     // Threaded: the demuxer reports underrun once its queues run dry.
@@ -244,6 +257,7 @@ int main(void)
     test_spu_wanted();
     test_wait_drained();
     test_wait_phase();
+    test_nav_hold();
     test_demux_drained();
     return 0;
 }

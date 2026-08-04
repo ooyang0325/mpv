@@ -79,6 +79,18 @@ static inline bool mp_nav_demux_drained(bool demux_underrun, int64_t fw_bytes)
     return demux_underrun || fw_bytes == 0;
 }
 
+// Whether the disc is "held" at a menu or still, i.e. intentionally parked
+// waiting for the user rather than actively playing content. The player uses
+// this to suppress the cache-buffering pause (an authored still produces no
+// packets until the user acts) and to idle the audio output: a button menu or
+// still is silent, so keeping the ao device open renders silence indefinitely,
+// pinning a CoreAudio render thread near 100% CPU and preventing a DVDNAV_WAIT
+// audio drain. Pure/inline for testing. still_seconds: 0 none, -1 inf, >0 timed.
+static inline bool mp_nav_hold(bool menu_active, int still_seconds)
+{
+    return menu_active || still_seconds != 0;
+}
+
 // User input actions: player/client -> stream.
 // Delivered via STREAM_CTRL_NAV_CMD.
 enum mp_nav_action {
