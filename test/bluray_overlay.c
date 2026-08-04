@@ -159,6 +159,23 @@ static void test_rle_multiline_eol(void)
         assert_int_equal(buf[i], expect[i]);
 }
 
+static void test_rle_empty_line(void)
+{
+    struct mp_bd_palette_entry pal[256] = {0};
+    pal[1] = (struct mp_bd_palette_entry){235, 128, 128, 255};
+    uint32_t white = conv(235, 128, 128, 255);
+    struct mp_bd_rle_elem rle[] = {
+        {0, 0}, // empty line
+        {2, 1},
+    };
+    uint32_t buf[4] = {0};
+    mp_bd_decode_rle(buf, 2, 2, 2, pal, rle);
+    assert_int_equal(buf[0], 0);
+    assert_int_equal(buf[1], 0);
+    assert_int_equal(buf[2], white);
+    assert_int_equal(buf[3], white);
+}
+
 int main(void)
 {
     test_palette();
@@ -166,5 +183,6 @@ int main(void)
     test_rle_overlong_run();
     test_rle_end_of_line();
     test_rle_multiline_eol();
+    test_rle_empty_line();
     return 0;
 }

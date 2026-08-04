@@ -22,6 +22,7 @@
 #ifndef MP_BLURAY_OVERLAY_H
 #define MP_BLURAY_OVERLAY_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // Layout-compatible with libbluray's BD_PG_PALETTE_ENTRY.
@@ -83,22 +84,24 @@ static inline void mp_bd_decode_rle(uint32_t *dst, int dst_stride, int w, int h,
 {
     const struct mp_bd_rle_elem *in = rle;
     int x = 0, y = 0;
+    bool wrapped = false;
     while (y < h) {
         int len = in->len;
         int color = in->color;
         ++in;
 
         if (len == 0) {
-            // End-of-line marker: finish the current line (only if it had
-            // content, so a marker following a line already filled to `w` is a
-            // harmless no-op).
-            if (x > 0) {
+            // A marker following an implicit width wrap is a harmless no-op.
+            // Otherwise it ends this line, including an empty line.
+            if (!wrapped) {
                 x = 0;
                 y++;
             }
+            wrapped = false;
             continue;
         }
 
+        wrapped = false;
         if (x + len > w)
             len = w - x; // clamp malformed/overlong runs to the line
         if (len > 0) {
@@ -113,6 +116,7 @@ static inline void mp_bd_decode_rle(uint32_t *dst, int dst_stride, int w, int h,
             // Line filled by runs without a trailing marker: wrap implicitly.
             x = 0;
             y++;
+            wrapped = true;
         }
     }
 }
