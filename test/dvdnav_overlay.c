@@ -22,6 +22,7 @@
  */
 
 #include "test_utils.h"
+#include "stream/discnav.h"
 #include "stream/dvdnav_overlay.h"
 
 // A minimal but complete SPU unit: a 4x2 display area at (0,0). Top field
@@ -188,6 +189,26 @@ static void test_spu_wanted(void)
     assert_false(mp_dvd_spu_wanted(0x21, 0x22));
 }
 
+static void test_wait_drained(void)
+{
+    // The DVDNAV_WAIT release requires the nested demux queues empty AND every
+    // present audio/video output to have presented everything.
+    // Nothing drained while demux still has data.
+    assert_false(mp_nav_wait_drained(false, true, true, true, true));
+    // Never release when nothing is playing (no outputs).
+    assert_false(mp_nav_wait_drained(true, false, false, false, false));
+    // Video-only: released once the video output drained.
+    assert_true(mp_nav_wait_drained(true, false, false, true, true));
+    assert_false(mp_nav_wait_drained(true, false, false, true, false));
+    // Audio-only.
+    assert_true(mp_nav_wait_drained(true, true, true, false, false));
+    assert_false(mp_nav_wait_drained(true, true, false, false, false));
+    // Both present: both must have drained.
+    assert_true(mp_nav_wait_drained(true, true, true, true, true));
+    assert_false(mp_nav_wait_drained(true, true, true, true, false));
+    assert_false(mp_nav_wait_drained(true, true, false, true, true));
+}
+
 int main(void)
 {
     init_clut();
@@ -198,5 +219,6 @@ int main(void)
     test_menu_state();
     test_still_seconds();
     test_spu_wanted();
+    test_wait_drained();
     return 0;
 }

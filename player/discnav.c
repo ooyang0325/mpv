@@ -244,6 +244,14 @@ bool mp_nav_hold_active(struct MPContext *mpctx)
     return nav && (nav->st.menu_active || nav->st.still_seconds != 0);
 }
 
+// True while the disc stream is parked at a DVDNAV_WAIT sync point waiting for
+// the player pipeline to drain to that boundary. The player keeps presenting
+// (does not buffer-pause) and releases the wait once the pipeline has drained.
+bool mp_nav_wait_pending(struct MPContext *mpctx)
+{
+    return mpctx->nav_state && mpctx->nav_state->st.wait_pending;
+}
+
 bool mp_nav_popup_available(struct MPContext *mpctx)
 {
     return mpctx->nav_state && mpctx->nav_state->st.popup_available;

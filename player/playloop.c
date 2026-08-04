@@ -45,6 +45,7 @@
 #include "osdep/terminal.h"
 #include "osdep/timer.h"
 #include "stream/stream.h"
+#include "stream/discnav.h"
 #include "sub/dec_sub.h"
 #include "sub/osd.h"
 #include "video/out/vo.h"
@@ -771,6 +772,27 @@ static void handle_update_cache(struct MPContext *mpctx)
     // still delivered to the stream, which resumes the VM when the user acts.
     if (need_wait && mp_nav_hold_active(mpctx))
         need_wait = false;
+
+    // DVDNAV_WAIT pipeline-drain handshake. While the disc VM is parked at a WAIT
+    // sync point, keep presenting the queued data (never buffer-pause on it, so
+    // startup can't deadlock), and let the VM continue only once the pipeline has
+    // actually drained to that boundary: the nested demux queues are empty AND
+    // every present audio/video output has presented everything it had. This is
+    // a real FIFO drain, not a timer. The stream then performs the wait_skip on
+    // its own read thread, preserving the single live dvdnav_t.
+    if (mp_nav_wait_pending(mpctx)) {
+        need_wait = false;
+        // Use the sticky per-output drain state (ao_underrun / underrun_signaled)
+        // rather than the transient `underrun` flags, which clear_underruns()
+        // resets every call.
+        bool have_a = !!mpctx->ao_chain, have_v = !!mpctx->vo_chain;
+        bool a_drained = have_a && mpctx->ao_chain->ao_underrun;
+        bool v_drained = have_v && mpctx->vo_chain->underrun_signaled;
+        if (mp_nav_wait_drained(s.underrun, have_a, a_drained, have_v, v_drained))
+            stream_control(mpctx->demuxer->stream, STREAM_CTRL_NAV_WAIT_DONE, NULL);
+        else
+            mp_set_timeout(mpctx, 0.02); // poll the drain promptly (not a timer)
+    }
 
     if (mpctx->paused_for_cache != need_wait) {
         mpctx->paused_for_cache = need_wait;

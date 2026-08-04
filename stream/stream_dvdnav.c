@@ -65,11 +65,6 @@
 // Poll interval while parked on a still frame, to avoid busy-spinning (ns).
 #define DVD_STILL_POLL_NS (20 * 1000 * 1000)
 
-// Bounded, cancel-aware drain window for a DVDNAV_WAIT sync point (number of
-// DVD_STILL_POLL_NS polls). Long enough to let the player present in-flight
-// data, short enough that it can never deadlock startup buffering (~200 ms).
-#define DVD_WAIT_DRAIN_POLLS 10
-
 struct priv {
     dvdnav_t *dvdnav;                   // handle to libdvdnav stuff
     char *filename;                     // path
@@ -116,6 +111,8 @@ struct priv {
     uint32_t uo_mask;
     int still_length;        // 0: none, -1: infinite, >0: seconds
     bool reset_pending;      // nested demuxer should re-sync
+    bool wait_pending;       // parked at a DVDNAV_WAIT sync point
+    bool wait_release;       // player signalled its pipeline has drained
     struct mp_nav_cmd *cmd_queue;
     int num_cmds;
 
@@ -742,20 +739,38 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
         }
         case DVDNAV_WAIT: {
             // Timing-critical sync point: libdvdnav is ahead of what has been
-            // presented and asks us to let our buffers drain before continuing.
-            // Do NOT skip immediately, but do NOT block on an unbounded drain
-            // either (that deadlocks when the demux cache is buffering before
-            // playback has begun, since nothing is being presented yet). Park
-            // the demux read for a short, cancel-aware, bounded window so the
-            // player thread can present in-flight data (the demux cache absorbs
-            // this pause), then release. The live VM is preserved; no nested
-            // EOF is forced, so nothing needs to recover.
-            for (int i = 0; i < DVD_WAIT_DRAIN_POLLS; i++) {
-                if (s->cancel && mp_cancel_test(s->cancel))
+            // presented and requires the player's FIFOs to drain to this
+            // boundary before it continues. Park the demux read (cancelable, no
+            // EOF forced) and expose wait_pending; the player observes the WAIT
+            // and calls STREAM_CTRL_NAV_WAIT_DONE only once its nested demux
+            // queues and decoded audio/video output have actually drained. Only
+            // then do we skip and continue -- never on a timer. The live
+            // dvdnav_t VM is preserved and no seek/reopen happens. Nav input is
+            // still applied so the menu stays responsive during the wait.
+            mp_mutex_lock(&p->nav_lock);
+            p->wait_pending = true;
+            p->wait_release = false;
+            mp_mutex_unlock(&p->nav_lock);
+            for (;;) {
+                dvd_drain_nav_commands(s);
+                mp_mutex_lock(&p->nav_lock);
+                bool release = p->wait_release;
+                mp_mutex_unlock(&p->nav_lock);
+                if (release)
                     break;
+                if (s->cancel && mp_cancel_test(s->cancel)) {
+                    mp_mutex_lock(&p->nav_lock);
+                    p->wait_pending = false;
+                    mp_mutex_unlock(&p->nav_lock);
+                    return 0;
+                }
                 mp_sleep_ns(DVD_STILL_POLL_NS);
             }
             dvdnav_wait_skip(nav);
+            mp_mutex_lock(&p->nav_lock);
+            p->wait_pending = false;
+            p->wait_release = false;
+            mp_mutex_unlock(&p->nav_lock);
             still_start = 0;
             break;
         }
@@ -1119,6 +1134,7 @@ static int control(stream_t *stream, int cmd, void *arg)
             .popup_available = false, // DVD has no Blu-ray-style popup menu
             .mouse_over_button = priv->mouse_over_button,
             .overlay_visible = priv->overlay_visible,
+            .wait_pending = priv->wait_pending,
             .still_seconds = priv->still_length,
             .uo_mask = priv->uo_mask,
             .overlay_w = priv->overlay_w,
@@ -1149,6 +1165,21 @@ static int control(stream_t *stream, int cmd, void *arg)
         priv->reset_pending = false;
         mp_mutex_unlock(&priv->nav_lock);
         return pending ? STREAM_OK : STREAM_UNSUPPORTED;
+    }
+    case STREAM_CTRL_NAV_WAIT_DONE: {
+        // The player reports that its pipeline has drained to the DVDNAV_WAIT
+        // boundary. Just flag the release; the actual dvdnav_wait_skip() runs on
+        // the demux read thread (the WAIT park loop) so the VM is only ever
+        // touched from one thread. Called from the player thread while the read
+        // thread is parked in fill_buffer.
+        if (!priv->use_nav)
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&priv->nav_lock);
+        bool waiting = priv->wait_pending;
+        if (waiting)
+            priv->wait_release = true;
+        mp_mutex_unlock(&priv->nav_lock);
+        return waiting ? STREAM_OK : STREAM_UNSUPPORTED;
     }
     }
 

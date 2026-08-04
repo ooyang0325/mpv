@@ -33,11 +33,28 @@ struct mp_nav_state_info {
     bool popup_available;    // a popup menu can be toggled (BD_EVENT_POPUP)
     bool mouse_over_button;  // last mouse position was over a menu button
     bool overlay_visible;    // a menu overlay is currently displayed
+    bool wait_pending;       // stream parked at a DVDNAV_WAIT sync point
     int still_seconds;       // 0: none, -1: infinite still, >0: timed still
     uint32_t uo_mask;        // BLURAY_UO_* mask of prohibited operations
     int overlay_w, overlay_h; // authored overlay plane resolution (for scaling)
     int overlay_change_id;   // bumped whenever the overlay bitmaps change
 };
+
+// Whether the player pipeline has drained to a DVDNAV_WAIT boundary and the
+// stream may be told to continue: the nested demux queues are empty and every
+// present audio/video output has presented everything it had. Pure/inline so it
+// can be unit tested without the player. Returns false while anything is still
+// buffered, and false when nothing is playing (never release blindly).
+static inline bool mp_nav_wait_drained(bool demux_empty,
+                                       bool have_audio, bool audio_drained,
+                                       bool have_video, bool video_drained)
+{
+    if (!demux_empty)
+        return false;
+    if (!have_audio && !have_video)
+        return false;
+    return (!have_audio || audio_drained) && (!have_video || video_drained);
+}
 
 // User input actions: player/client -> stream.
 // Delivered via STREAM_CTRL_NAV_CMD.
