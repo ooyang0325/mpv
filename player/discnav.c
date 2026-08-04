@@ -46,7 +46,9 @@ struct mp_nav_state {
     struct mp_osd_res last_res;
 };
 
-// Return the bluray stream if the current demuxer is a disc menu stream.
+// Return the disc stream if the current demuxer is a disc menu stream
+// (Blu-ray HDMV or DVD). All of the player-side handling below is media
+// agnostic: it drives the shared discnav.h contract.
 static struct stream *get_nav_stream(struct MPContext *mpctx)
 {
     struct demuxer *demuxer = mpctx->demuxer;
@@ -54,7 +56,8 @@ static struct stream *get_nav_stream(struct MPContext *mpctx)
         !demuxer->stream->info)
         return NULL;
     const char *name = demuxer->stream->info->name;
-    if (strcmp(name, "bd") != 0 && strcmp(name, "bdmv/bluray") != 0)
+    if (strcmp(name, "bd") != 0 && strcmp(name, "bdmv/bluray") != 0 &&
+        strcmp(name, "dvdnav") != 0 && strcmp(name, "ifo_dvdnav") != 0)
         return NULL;
     return demuxer->stream;
 }

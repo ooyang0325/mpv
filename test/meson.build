@@ -100,6 +100,10 @@ bluray_overlay = executable('bluray-overlay', files('bluray_overlay.c'),
                             include_directories: incdir, link_with: test_utils)
 test('bluray-overlay', bluray_overlay)
 
+dvdnav_overlay = executable('dvdnav-overlay', files('dvdnav_overlay.c'),
+                            include_directories: incdir, link_with: test_utils)
+test('dvdnav-overlay', dvdnav_overlay)
+
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 

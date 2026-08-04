@@ -1336,9 +1336,14 @@ PROTOCOLS
 
 ``dvd://[title][/device]`` ``--dvd-device=PATH``
 
-    Play a DVD. DVD menus are not supported. If no title is given, the longest
-    title is auto-selected. Without ``--dvd-device``, it will probably try
-    to open an actual optical drive, if available and implemented for the OS.
+    Play a DVD. If no title is given, the longest title is auto-selected.
+    Without ``--dvd-device``, it will probably try to open an actual optical
+    drive, if available and implemented for the OS.
+
+    ``dvd://menu[/device]`` opens the DVD in menu (navigation) mode: the disc's
+    authored menus are shown and can be driven with the ``discnav`` command,
+    reusing libdvdnav's DVD VM. Direct title playback (``dvd://<title>``) is
+    unaffected.
 
     ``dvdnav://`` is an old alias for ``dvd://`` and does exactly the same
     thing.

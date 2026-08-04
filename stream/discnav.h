@@ -60,6 +60,13 @@ struct mp_nav_cmd {
     int x, y; // authored (overlay-plane) coordinates for mouse actions
 };
 
+// Generic prohibited-operation flags exposed in mp_nav_state_info.uo_mask.
+// Producers translate the library's native UOP mask into this small subset the
+// player may care about; unset means "operation currently allowed".
+#define MP_NAV_UO_BUTTON  (1u << 0) // button select/activate prohibited
+#define MP_NAV_UO_MENU    (1u << 1) // menu call prohibited
+#define MP_NAV_UO_RESUME  (1u << 2) // resume/leave-menu prohibited
+
 // Overlay fetch result: bitmaps, their generation id and authored resolution,
 // retrieved together via STREAM_CTRL_GET_NAV_OVERLAY so the consumer can never
 // pair a bitmap generation with a mismatched change id or scaling size.

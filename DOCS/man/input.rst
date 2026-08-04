@@ -986,10 +986,11 @@ OSD Commands
     if no overlay with this ID exists.
 
 ``discnav <action>``
-    Send a navigation action to the disc menu of a Blu-ray opened in menu mode
-    (``bd://menu``, or the ``bluray://menu`` alias). The menu overlay is rendered
-    on a dedicated OSD source that does not interfere with ``overlay-add``. Does
-    nothing if the current file is not a disc in navigation mode.
+    Send a navigation action to the disc menu of a Blu-ray or DVD opened in menu
+    mode (``bd://menu`` / ``bluray://menu``, or ``dvd://menu``). The menu overlay
+    is rendered on a dedicated OSD source that does not interfere with
+    ``overlay-add``. Does nothing if the current file is not a disc in
+    navigation mode.
 
     ``<action>`` is one of:
 
@@ -1000,7 +1001,8 @@ OSD Commands
     ``menu`` or ``top-menu``
         Open the disc top/root menu.
     ``popup``
-        Toggle the popup menu.
+        Toggle the popup menu. On DVD (which has no popup menu) this opens the
+        root menu instead.
     ``mouse-move``, ``mouse-click``
         Move the pointer to / click at the current mouse position (mapped from
         window to authored video coordinates). ``mouse`` is an alias for
@@ -3187,13 +3189,14 @@ Property list
     does not support it.
 
 ``disc-menu-active``
-    Read-only - ``yes`` while an interactive Blu-ray disc menu (HDMV) is on
-    screen for a disc opened in menu mode (``bd://menu``). Use the ``discnav``
-    command to interact with it.
+    Read-only - ``yes`` while an interactive disc menu is on screen for a disc
+    opened in menu mode: a Blu-ray HDMV menu (``bd://menu``) or a DVD menu
+    (``dvd://menu``). Use the ``discnav`` command to interact with it.
 
 ``disc-menu-popup-available``
     Read-only - ``yes`` if a popup menu can currently be toggled with
-    ``discnav popup`` on a disc opened in menu mode.
+    ``discnav popup`` on a disc opened in menu mode. Always ``no`` for DVD, which
+    has no popup menu.
 
 ``disc-mouse-on-button``
     Read-only - ``yes`` if the last mouse position mapped onto a selectable disc

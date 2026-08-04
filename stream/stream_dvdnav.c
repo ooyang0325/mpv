@@ -40,19 +40,30 @@
 #include <libavutil/intreadwrite.h>
 
 #include "osdep/io.h"
+#include "osdep/threads.h"
 
+#include "mpv_talloc.h"
+#include "common/common.h"
 #include "options/options.h"
 #include "common/msg.h"
 #include "input/input.h"
+#include "misc/thread_tools.h"
 #include "options/m_config.h"
 #include "options/path.h"
 #include "osdep/timer.h"
 #include "stream.h"
+#include "discnav.h"
+#include "dvdnav_overlay.h"
+#include "sub/osd.h"
+#include "video/mp_image.h"
 #include "demux/demux.h"
 #include "video/out/vo.h"
 
 #define TITLE_MENU -1
 #define TITLE_LONGEST -2
+
+// Poll interval while parked on a still frame, to avoid busy-spinning (ns).
+#define DVD_STILL_POLL_NS (20 * 1000 * 1000)
 
 struct priv {
     dvdnav_t *dvdnav;                   // handle to libdvdnav stuff
@@ -68,6 +79,38 @@ struct priv {
 
     int track;
     char *device;
+
+    // Disc menu navigation (menu mode only). Direct title playback leaves all
+    // of the following untouched. The live dvdnav_t is never recreated across
+    // First Play/VMGM/VTS/cell/hop transitions.
+    bool use_nav;
+
+    // Read-thread-only decode state (touched only inside fill_buffer).
+    uint8_t *spu_accum;      // in-progress subpicture unit (talloc)
+    int spu_accum_len;
+    int spu_want;            // target size of the unit being assembled
+    int spu_sub;            // substream id of the unit being assembled
+    struct mp_dvdspu spu;    // last fully decoded subpicture (spu.idx malloc'd)
+    bool spu_valid;
+    bool overlay_dirty;      // overlay needs to be rebuilt/published
+    bool skip_still;         // a user action asked to leave the current still
+    bool activated;          // draw the selected button in its "action" colors
+    int cur_domain;          // tracked DVD domain, for demux re-sync detection
+    int video_w, video_h;    // authored overlay-plane (video) resolution
+
+    // Shared with the player thread; protected by nav_lock.
+    mp_mutex nav_lock;
+    struct sub_bitmaps *pending_overlay; // owned; handed to the player on demand
+    int overlay_change_id;
+    int overlay_w, overlay_h;
+    bool overlay_visible;
+    bool menu_active;
+    bool mouse_over_button;
+    uint32_t uo_mask;
+    int still_length;        // 0: none, -1: infinite, >0: seconds
+    bool reset_pending;      // nested demuxer should re-sync
+    struct mp_nav_cmd *cmd_queue;
+    int num_cmds;
 
     struct dvd_opts *opts;
 };
@@ -276,6 +319,465 @@ static int mp_dvdnav_number_of_subs(stream_t *stream)
     return n;
 }
 
+// ---- Disc menu navigation (menu mode only) -------------------------------
+
+static void dvd_reset_spu(struct priv *p)
+{
+    p->spu_accum_len = 0;
+    p->spu_want = 0;
+    p->spu_sub = -1;
+    mp_dvdspu_free(&p->spu);
+    p->spu_valid = false;
+    p->overlay_dirty = true;
+}
+
+// Accumulate subpicture (SPU) fragments demuxed out of the VOB into a whole
+// unit and decode it. A PES with a PTS starts a new unit; continuation packets
+// carry no PTS. Runs on the demuxer read thread only.
+static void dvd_spu_accumulate(stream_t *s, int substream, bool has_pts,
+                               const uint8_t *data, int len)
+{
+    struct priv *p = s->priv;
+    if (substream < 0x20 || substream > 0x3f) // subpicture substreams only
+        return;
+
+    if (has_pts) {
+        p->spu_accum_len = 0;
+        if (len < 2)
+            return;
+        int size = (data[0] << 8) | data[1];
+        if (size < 4)
+            return;
+        p->spu_want = MPMIN(size, 128 * 1024);
+        p->spu_sub = substream;
+    } else {
+        if (p->spu_accum_len == 0 || substream != p->spu_sub)
+            return; // no unit start seen yet, or a different substream
+    }
+
+    int room = p->spu_want - p->spu_accum_len;
+    int n = MPMIN(len, room);
+    if (n <= 0)
+        return;
+    MP_TARRAY_GROW(p, p->spu_accum, p->spu_accum_len + n);
+    memcpy(p->spu_accum + p->spu_accum_len, data, n);
+    p->spu_accum_len += n;
+
+    if (p->spu_accum_len >= p->spu_want) {
+        struct mp_dvdspu decoded;
+        if (mp_dvdspu_decode(p->spu_accum, p->spu_want, &decoded)) {
+            mp_dvdspu_free(&p->spu);
+            p->spu = decoded;
+            p->spu_valid = true;
+            p->overlay_dirty = true;
+        }
+        p->spu_accum_len = 0;
+    }
+}
+
+// Peek at a DVD pack (2048-byte MPEG-2 program stream sector) and feed any
+// subpicture payload to the SPU assembler. Read-only: the block still flows to
+// the nested demuxer unchanged.
+static void dvd_sniff_spu(stream_t *s, const uint8_t *buf)
+{
+    if (!(buf[0] == 0 && buf[1] == 0 && buf[2] == 1 && buf[3] == 0xBA))
+        return; // not a pack header
+    int pos = 14 + (buf[13] & 7); // pack header + stuffing
+    while (pos + 6 <= 2048) {
+        if (!(buf[pos] == 0 && buf[pos + 1] == 0 && buf[pos + 2] == 1))
+            break;
+        int sid = buf[pos + 3];
+        int plen = (buf[pos + 4] << 8) | buf[pos + 5];
+        if (sid == 0xBD && pos + 9 <= 2048 && (buf[pos + 6] & 0xC0) == 0x80) {
+            bool has_pts = (buf[pos + 7] & 0x80) != 0;
+            int hdrlen = buf[pos + 8];
+            int data = pos + 9 + hdrlen;
+            int end = pos + 6 + plen;
+            if (end > 2048)
+                end = 2048;
+            if (data < end) {
+                int substream = buf[data];
+                dvd_spu_accumulate(s, substream, has_pts,
+                                   buf + data + 1, end - (data + 1));
+            }
+        }
+        if (plen <= 0)
+            break;
+        pos += 6 + plen;
+    }
+}
+
+// Build a single-part BGRA overlay from the last decoded subpicture, recoloring
+// the currently selected/activated button inside its PCI crop rectangle.
+static struct sub_bitmaps *dvd_build_overlay(stream_t *s, pci_t *pci)
+{
+    struct priv *p = s->priv;
+    if (!p->spu_valid || !p->spu.idx || !p->spu_clut_valid)
+        return NULL;
+    struct mp_dvdspu *spu = &p->spu;
+
+    struct mp_dvdspu_hl hl = {0};
+    bool have_hl = false;
+    int32_t button = 0;
+    int btn_ns = pci->hli.hl_gi.btn_ns & 0x3f;
+    dvdnav_get_current_highlight(p->dvdnav, &button);
+    if (button > 0 && button <= btn_ns && button <= 36) {
+        btni_t *b = &pci->hli.btnit[button - 1];
+        hl.x1 = FFMIN(b->x_start, b->x_end);
+        hl.x2 = FFMAX(b->x_start, b->x_end);
+        hl.y1 = FFMIN(b->y_start, b->y_end);
+        hl.y2 = FFMAX(b->y_start, b->y_end);
+        int coln = b->btn_coln;
+        if (coln >= 1 && coln <= 3) {
+            hl.color = pci->hli.btn_colit.btn_coli[coln - 1][p->activated ? 1 : 0];
+            have_hl = true;
+        }
+    }
+
+    struct mp_image *packed = mp_image_alloc(IMGFMT_BGRA, spu->w, spu->h);
+    if (!packed)
+        return NULL;
+    mp_image_clear(packed, 0, 0, spu->w, spu->h);
+    mp_dvdspu_render_bgra(spu, p->spu_clut, have_hl ? &hl : NULL,
+                          (uint32_t *)packed->planes[0], packed->stride[0] / 4);
+
+    struct sub_bitmaps *res = talloc_zero(NULL, struct sub_bitmaps);
+    res->format = SUBBITMAP_BGRA;
+    res->packed = talloc_steal(res, packed);
+    res->packed_w = spu->w;
+    res->packed_h = spu->h;
+    res->parts = talloc_array(res, struct sub_bitmap, 1);
+    res->parts[0] = (struct sub_bitmap){
+        .bitmap = packed->planes[0],
+        .stride = packed->stride[0],
+        .w = spu->w, .h = spu->h,
+        .dw = spu->w, .dh = spu->h,
+        .x = spu->x, .y = spu->y,
+        .src_x = 0, .src_y = 0,
+    };
+    res->num_parts = 1;
+    return res;
+}
+
+static bool dvd_in_menu_domain(dvdnav_t *nav)
+{
+    return dvdnav_is_domain_fp(nav) > 0 || dvdnav_is_domain_vmgm(nav) > 0 ||
+           dvdnav_is_domain_vtsm(nav) > 0;
+}
+
+// Rebuild the overlay/state snapshot and publish it to the player side. Bitmaps
+// are built outside the lock; the change id, bitmaps, visibility and authored
+// size are stored together under nav_lock so the consumer stays consistent.
+static void dvd_publish_overlay(stream_t *s)
+{
+    struct priv *p = s->priv;
+    dvdnav_t *nav = p->dvdnav;
+
+    bool menu_domain = dvd_in_menu_domain(nav);
+    pci_t *pci = dvdnav_get_current_nav_pci(nav);
+    int btn_ns = (pci && menu_domain) ? (pci->hli.hl_gi.btn_ns & 0x3f) : 0;
+
+    struct sub_bitmaps *imgs = NULL;
+    bool over_button = false;
+    uint32_t uo = 0;
+    if (menu_domain && btn_ns > 0) {
+        imgs = dvd_build_overlay(s, pci);
+        int32_t button = 0;
+        dvdnav_get_current_highlight(nav, &button);
+        over_button = button > 0;
+        // Surface the authored UOP restrictions the player may care about.
+        user_ops_t ops = pci->pci_gi.vobu_uop_ctl;
+        if (ops.button_select_or_activate) uo |= MP_NAV_UO_BUTTON;
+        if (ops.title_menu_call || ops.root_menu_call) uo |= MP_NAV_UO_MENU;
+        if (ops.resume) uo |= MP_NAV_UO_RESUME;
+    }
+
+    uint32_t w = p->video_w > 0 ? p->video_w : 720;
+    uint32_t h = p->video_h > 0 ? p->video_h : 480;
+
+    mp_mutex_lock(&p->nav_lock);
+    int id = ++p->overlay_change_id;
+    if (imgs)
+        imgs->change_id = id;
+    talloc_free(p->pending_overlay);
+    p->pending_overlay = imgs;
+    p->overlay_visible = imgs != NULL;
+    p->menu_active = mp_dvd_menu_active(menu_domain, btn_ns);
+    p->mouse_over_button = over_button;
+    p->uo_mask = uo;
+    p->overlay_w = w;
+    p->overlay_h = h;
+    mp_mutex_unlock(&p->nav_lock);
+}
+
+// Apply a single navigation command. Runs on the demuxer read thread so that
+// the dvdnav_t VM is only ever touched from one thread.
+static void dvd_apply_nav_command(stream_t *s, struct mp_nav_cmd *cmd)
+{
+    struct priv *p = s->priv;
+    dvdnav_t *nav = p->dvdnav;
+    pci_t *pci = dvdnav_get_current_nav_pci(nav);
+    if (!pci)
+        return;
+    user_ops_t uo = pci->pci_gi.vobu_uop_ctl;
+
+    switch (cmd->action) {
+    case MP_NAV_ACTION_UP:
+        if (!uo.button_select_or_activate)
+            dvdnav_upper_button_select(nav, pci);
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_DOWN:
+        if (!uo.button_select_or_activate)
+            dvdnav_lower_button_select(nav, pci);
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_LEFT:
+        if (!uo.button_select_or_activate)
+            dvdnav_left_button_select(nav, pci);
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_RIGHT:
+        if (!uo.button_select_or_activate)
+            dvdnav_right_button_select(nav, pci);
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_SELECT:
+        if (!uo.button_select_or_activate) {
+            p->activated = true;
+            dvdnav_button_activate(nav, pci);
+            p->skip_still = true;
+        }
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_MENU:
+        if (!uo.root_menu_call && dvdnav_menu_call(nav, DVD_MENU_Root) != DVDNAV_STATUS_OK) {
+            if (!uo.title_menu_call)
+                dvdnav_menu_call(nav, DVD_MENU_Title);
+        }
+        p->skip_still = true;
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_POPUP:
+        // DVD has no popup menu; treat it like opening the root menu.
+        if (!uo.root_menu_call)
+            dvdnav_menu_call(nav, DVD_MENU_Root);
+        p->skip_still = true;
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_MOUSE_MOVE: {
+        p->mousex = cmd->x;
+        p->mousey = cmd->y;
+        dvdnav_status_t st = dvdnav_mouse_select(nav, pci, cmd->x, cmd->y);
+        mp_mutex_lock(&p->nav_lock);
+        p->mouse_over_button = st == DVDNAV_STATUS_OK;
+        mp_mutex_unlock(&p->nav_lock);
+        p->overlay_dirty = true;
+        break;
+    }
+    case MP_NAV_ACTION_MOUSE_CLICK:
+        p->mousex = cmd->x;
+        p->mousey = cmd->y;
+        if (!uo.button_select_or_activate) {
+            p->activated = true;
+            dvdnav_mouse_activate(nav, pci, cmd->x, cmd->y);
+            p->skip_still = true;
+        }
+        p->overlay_dirty = true;
+        break;
+    case MP_NAV_ACTION_RESUME:
+        // Leave the menu / resume playback where possible.
+        if (!uo.resume)
+            dvdnav_menu_call(nav, DVD_MENU_Escape);
+        p->skip_still = true;
+        p->overlay_dirty = true;
+        break;
+    default:
+        break;
+    }
+}
+
+// Drain and apply all queued navigation commands (demuxer read thread).
+static void dvd_drain_nav_commands(stream_t *s)
+{
+    struct priv *p = s->priv;
+    mp_mutex_lock(&p->nav_lock);
+    struct mp_nav_cmd *queue = p->cmd_queue;
+    int num = p->num_cmds;
+    p->cmd_queue = NULL;
+    p->num_cmds = 0;
+    mp_mutex_unlock(&p->nav_lock);
+
+    for (int i = 0; i < num; i++)
+        dvd_apply_nav_command(s, &queue[i]);
+    talloc_free(queue);
+}
+
+static void dvd_update_video_res(struct priv *p)
+{
+    uint32_t w = 0, h = 0;
+    if (dvdnav_get_video_resolution(p->dvdnav, &w, &h) == 0 && w > 0 && h > 0) {
+        p->video_w = w;
+        p->video_h = h;
+    }
+}
+
+// Menu-mode read loop: keeps one live dvdnav_t, applies queued input, decodes
+// the menu subpicture/highlight, and parks on stills without busy-spinning.
+static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
+{
+    struct priv *p = s->priv;
+    dvdnav_t *nav = p->dvdnav;
+    int64_t still_start = 0;
+
+    for (;;) {
+        dvd_drain_nav_commands(s);
+        if (p->overlay_dirty) {
+            dvd_publish_overlay(s);
+            p->overlay_dirty = false;
+        }
+
+        int len = -1, event = DVDNAV_NOP;
+        if (dvdnav_get_next_block(nav, buf, &event, &len) != DVDNAV_STATUS_OK) {
+            MP_ERR(s, "Error getting next block from DVD %d (%s)\n",
+                   event, dvdnav_err_to_string(nav));
+            return 0;
+        }
+        if (event != DVDNAV_BLOCK_OK) {
+            const char *name = LOOKUP_NAME(mp_dvdnav_events, event);
+            MP_TRACE(s, "DVDNAV: event %s (%d).\n", name, event);
+        }
+
+        switch (event) {
+        case DVDNAV_BLOCK_OK:
+            dvd_sniff_spu(s, buf);
+            if (p->overlay_dirty) {
+                dvd_publish_overlay(s);
+                p->overlay_dirty = false;
+            }
+            return len;
+        case DVDNAV_STOP:
+            return 0;
+        case DVDNAV_NAV_PACKET:
+            // A new PCI (buttons/UOP) is now current: refresh the overlay. The
+            // nav pack itself is a private stream the demuxer ignores; don't
+            // return it.
+            p->overlay_dirty = true;
+            still_start = 0;
+            break;
+        case DVDNAV_STILL_FRAME: {
+            dvdnav_still_event_t *ev = (dvdnav_still_event_t *)buf;
+            int length = ev->length; // 0xff => infinite
+            mp_mutex_lock(&p->nav_lock);
+            p->still_length = length == 0xff ? -1 : (length > 0 ? length : -1);
+            mp_mutex_unlock(&p->nav_lock);
+            if (p->overlay_dirty) {
+                dvd_publish_overlay(s);
+                p->overlay_dirty = false;
+            }
+
+            if (p->skip_still) {
+                p->skip_still = false;
+                dvdnav_still_skip(nav);
+                mp_mutex_lock(&p->nav_lock);
+                p->still_length = 0;
+                mp_mutex_unlock(&p->nav_lock);
+                still_start = 0;
+                break;
+            }
+            if (length != 0xff && length > 0) {
+                if (!still_start)
+                    still_start = mp_time_ns();
+                if (mp_time_ns() - still_start >= (int64_t)length * 1000000000) {
+                    dvdnav_still_skip(nav);
+                    mp_mutex_lock(&p->nav_lock);
+                    p->still_length = 0;
+                    mp_mutex_unlock(&p->nav_lock);
+                    still_start = 0;
+                    break;
+                }
+            }
+            if (s->cancel && mp_cancel_test(s->cancel))
+                return 0;
+            mp_sleep_ns(DVD_STILL_POLL_NS);
+            break;
+        }
+        case DVDNAV_WAIT:
+            dvdnav_wait_skip(nav);
+            still_start = 0;
+            break;
+        case DVDNAV_HIGHLIGHT:
+            p->activated = false;
+            p->overlay_dirty = true;
+            still_start = 0;
+            break;
+        case DVDNAV_SPU_CLUT_CHANGE:
+            memcpy(p->spu_clut, buf, 16 * sizeof(uint32_t));
+            p->spu_clut_valid = true;
+            p->overlay_dirty = true;
+            break;
+        case DVDNAV_SPU_STREAM_CHANGE:
+            // A different subpicture stream is active now: drop any half-built
+            // unit so we never mix menus.
+            dvd_reset_spu(p);
+            break;
+        case DVDNAV_AUDIO_STREAM_CHANGE:
+            break;
+        case DVDNAV_VTS_CHANGE: {
+            dvd_update_video_res(p);
+            p->cur_domain = dvdnav_is_domain_vts(nav) > 0 ? 3 :
+                            dvdnav_is_domain_vtsm(nav) > 0 ? 2 :
+                            dvdnav_is_domain_vmgm(nav) > 0 ? 1 : 0;
+            dvd_reset_spu(p);
+            p->activated = false;
+            if (!p->had_initial_vts) {
+                // dvdnav emits an initial VTS change before any data; don't ask
+                // the nested demuxer to re-sync before it has even started.
+                p->had_initial_vts = true;
+            } else {
+                // Any VTS boundary is an elementary-stream discontinuity.
+                mp_mutex_lock(&p->nav_lock);
+                p->reset_pending = true;
+                mp_mutex_unlock(&p->nav_lock);
+            }
+            dvd_publish_overlay(s);
+            p->overlay_dirty = false;
+            still_start = 0;
+            break;
+        }
+        case DVDNAV_CELL_CHANGE: {
+            dvdnav_cell_change_event_t *ev = (dvdnav_cell_change_event_t *)buf;
+            if (ev->pgc_length)
+                p->duration = ev->pgc_length / 90;
+            int new_domain = dvdnav_is_domain_vts(nav) > 0 ? 3 :
+                             dvdnav_is_domain_vtsm(nav) > 0 ? 2 :
+                             dvdnav_is_domain_vmgm(nav) > 0 ? 1 : 0;
+            if (mp_dvd_domain_changed(p->cur_domain, new_domain)) {
+                p->cur_domain = new_domain;
+                dvd_reset_spu(p);
+                p->activated = false;
+                mp_mutex_lock(&p->nav_lock);
+                p->reset_pending = true;
+                mp_mutex_unlock(&p->nav_lock);
+            }
+            p->overlay_dirty = true;
+            still_start = 0;
+            break;
+        }
+        case DVDNAV_HOP_CHANNEL:
+            dvd_reset_spu(p);
+            mp_mutex_lock(&p->nav_lock);
+            p->reset_pending = true;
+            mp_mutex_unlock(&p->nav_lock);
+            still_start = 0;
+            break;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
 static int fill_buffer(stream_t *s, void *buf, int max_len)
 {
     struct priv *priv = s->priv;
@@ -286,6 +788,9 @@ static int fill_buffer(stream_t *s, void *buf, int max_len)
                     "provide a patch.\n");
         return -1;
     }
+
+    if (priv->use_nav)
+        return dvd_nav_fill_buffer(s, buf, max_len);
 
     while (1) {
         int len = -1;
@@ -531,6 +1036,56 @@ static int control(stream_t *stream, int cmd, void *arg)
         *(char**)arg = talloc_strdup(NULL, volume);
         return STREAM_OK;
     }
+    case STREAM_CTRL_NAV_CMD: {
+        if (!priv->use_nav)
+            return STREAM_UNSUPPORTED;
+        struct mp_nav_cmd *in = arg;
+        mp_mutex_lock(&priv->nav_lock);
+        MP_TARRAY_APPEND(priv, priv->cmd_queue, priv->num_cmds, *in);
+        mp_mutex_unlock(&priv->nav_lock);
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_NAV_STATE: {
+        if (!priv->use_nav)
+            return STREAM_UNSUPPORTED;
+        struct mp_nav_state_info *out = arg;
+        mp_mutex_lock(&priv->nav_lock);
+        *out = (struct mp_nav_state_info){
+            .menu_active = priv->menu_active,
+            .popup_available = false, // DVD has no Blu-ray-style popup menu
+            .mouse_over_button = priv->mouse_over_button,
+            .overlay_visible = priv->overlay_visible,
+            .still_seconds = priv->still_length,
+            .uo_mask = priv->uo_mask,
+            .overlay_w = priv->overlay_w,
+            .overlay_h = priv->overlay_h,
+            .overlay_change_id = priv->overlay_change_id,
+        };
+        mp_mutex_unlock(&priv->nav_lock);
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_NAV_OVERLAY: {
+        if (!priv->use_nav)
+            return STREAM_UNSUPPORTED;
+        struct mp_nav_overlay *out = arg;
+        mp_mutex_lock(&priv->nav_lock);
+        out->imgs = priv->pending_overlay; // transfer ownership
+        priv->pending_overlay = NULL;
+        out->change_id = priv->overlay_change_id;
+        out->w = priv->overlay_w;
+        out->h = priv->overlay_h;
+        mp_mutex_unlock(&priv->nav_lock);
+        return STREAM_OK;
+    }
+    case STREAM_CTRL_GET_NAV_RESET: {
+        if (!priv->use_nav)
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&priv->nav_lock);
+        bool pending = priv->reset_pending;
+        priv->reset_pending = false;
+        mp_mutex_unlock(&priv->nav_lock);
+        return pending ? STREAM_OK : STREAM_UNSUPPORTED;
+    }
     }
 
     return STREAM_UNSUPPORTED;
@@ -539,6 +1094,16 @@ static int control(stream_t *stream, int cmd, void *arg)
 static void stream_dvdnav_close(stream_t *s)
 {
     struct priv *priv = s->priv;
+    if (priv->use_nav) {
+        talloc_free(priv->pending_overlay);
+        priv->pending_overlay = NULL;
+        talloc_free(priv->cmd_queue);
+        priv->cmd_queue = NULL;
+        priv->num_cmds = 0;
+        mp_dvdspu_free(&priv->spu);
+        mp_mutex_destroy(&priv->nav_lock);
+        priv->use_nav = false;
+    }
     if (priv->dvdnav)
         dvdnav_close(priv->dvdnav);
     priv->dvdnav = NULL;
@@ -635,9 +1200,15 @@ static int open_s_internal(stream_t *stream)
             goto err;
         }
     } else {
-        MP_FATAL(stream, "DVD menu support has been removed.\n");
-        ret = STREAM_ERROR;
-        goto err;
+        // Menu mode: keep one live dvdnav_t and let the disc's First Play
+        // program run (typically into the VMGM/root menu). The VM is never
+        // recreated across menu/title transitions.
+        priv->use_nav = true;
+        priv->cur_domain = -1;
+        priv->spu_sub = -1;
+        mp_mutex_init(&priv->nav_lock);
+        dvd_update_video_res(priv);
+        MP_VERBOSE(stream, "DVD menu navigation enabled\n");
     }
     if (p->opts->angle > 1)
         dvdnav_angle_change(priv->dvdnav, p->opts->angle);
