@@ -785,8 +785,9 @@ static void handle_update_cache(struct MPContext *mpctx)
         // Use the sticky per-output drain state (ao_underrun / underrun_signaled)
         // rather than the transient `underrun` flags, which clear_underruns()
         // resets every call.
-        bool have_a = !!mpctx->ao_chain, have_v = !!mpctx->vo_chain;
-        bool a_drained = have_a && mpctx->ao_chain->ao_underrun;
+        bool have_a = mpctx->ao && mpctx->ao_chain, have_v = !!mpctx->vo_chain;
+        bool a_drained = have_a && (mpctx->ao_chain->ao_underrun ||
+                                    mp_nav_audio_idle_active(mpctx));
         bool v_drained = have_v && mpctx->vo_chain->underrun_signaled;
         // s.underrun is forced false for an unthreaded demuxer, so also treat an
         // empty forward queue as drained (thread-independent); the outputs must

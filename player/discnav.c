@@ -30,6 +30,7 @@
 #include "input/input.h"
 
 #include "audio/bd_sfx.h"
+#include "audio/out/ao.h"
 
 #include "filters/f_async_queue.h"
 
@@ -54,7 +55,7 @@ struct mp_nav_state {
     struct sub_bitmaps *authored; // owned, in authored coords, for re-scaling
     int overlay_w, overlay_h;     // authored size paired with `authored`
     struct mp_osd_res last_res;
-    bool audio_idled;             // we deselected audio during a silent hold
+    bool audio_idled;             // AO is paused during a silent hold
     int audio_quiet_polls;        // consecutive polls the hold has been silent
 };
 
@@ -100,6 +101,8 @@ void mp_nav_destroy(struct MPContext *mpctx)
     mpctx->bd_sfx = NULL;
     if (!mpctx->nav_state)
         return;
+    if (mpctx->nav_state->audio_idled && mpctx->ao)
+        ao_set_paused(mpctx->ao, get_internal_paused(mpctx), false);
     osd_set_nav(mpctx->osd, NULL);
     talloc_free(mpctx->nav_state);
     mpctx->nav_state = NULL;
@@ -155,8 +158,9 @@ void mp_handle_nav(struct MPContext *mpctx)
     // still, or a WAIT-parked / looping button menu with no program audio,
     // otherwise keeps the audio device open rendering silence for the whole
     // (often indefinite) hold, pinning a CoreAudio render thread near 100% CPU
-    // and blocking the DVDNAV_WAIT audio drain; deselecting the audio track
-    // idles the device. But a motion menu (or still) that carries authored
+    // and blocking the DVDNAV_WAIT audio drain; pausing the AO idles the device
+    // without tearing down the selected track. But a motion menu (or still)
+    // that carries authored
     // in-band background music must keep playing, so only idle once the audio
     // output has actually been starved (no program audio) for a short debounce,
     // and reselect the default track when the hold ends. Audio still plays
@@ -168,25 +172,22 @@ void mp_handle_nav(struct MPContext *mpctx)
     // audio regardless of the output device streaming silence when starved
     // (a CoreAudio pull device keeps "playing", so its underrun flag is not a
     // reliable silence signal). A silent hold drains this queue to empty.
-    bool has_program_audio = mpctx->ao_chain &&
+    bool has_program_audio = mpctx->ao_chain && mpctx->ao_chain->ao_queue &&
         mp_async_queue_get_frames(mpctx->ao_chain->ao_queue) > 0;
     bool want_idle = mp_nav_audio_idle(info.menu_active, info.still_seconds,
                                        info.wait_pending, has_program_audio);
     nav->audio_quiet_polls = want_idle ? nav->audio_quiet_polls + 1 : 0;
-    if (want_idle && !nav->audio_idled &&
-        nav->audio_quiet_polls >= NAV_AUDIO_IDLE_DEBOUNCE)
+    if (want_idle && nav->audio_quiet_polls >= NAV_AUDIO_IDLE_DEBOUNCE &&
+        mpctx->ao)
     {
-        if (mpctx->current_track[0][STREAM_AUDIO]) {
-            mp_switch_track(mpctx, STREAM_AUDIO, NULL, 0);
-            nav->audio_idled = true;
-        }
+        // Reassert this while held: a user pause transition can otherwise
+        // resume the AO behind us. ao_set_paused() is idempotent.
+        ao_set_paused(mpctx->ao, true, false);
+        nav->audio_idled = true;
     } else if (!want_idle && nav->audio_idled) {
+        if (mpctx->ao)
+            ao_set_paused(mpctx->ao, get_internal_paused(mpctx), false);
         nav->audio_idled = false;
-        if (!mpctx->current_track[0][STREAM_AUDIO]) {
-            struct track *want = select_default_track(mpctx, 0, STREAM_AUDIO);
-            if (want)
-                mp_switch_track(mpctx, STREAM_AUDIO, want, 0);
-        }
     }
 
     struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
@@ -298,6 +299,11 @@ bool mp_nav_hold_active(struct MPContext *mpctx)
 bool mp_nav_wait_pending(struct MPContext *mpctx)
 {
     return mpctx->nav_state && mpctx->nav_state->st.wait_pending;
+}
+
+bool mp_nav_audio_idle_active(struct MPContext *mpctx)
+{
+    return mpctx->nav_state && mpctx->nav_state->audio_idled;
 }
 
 bool mp_nav_popup_available(struct MPContext *mpctx)
