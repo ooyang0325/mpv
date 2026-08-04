@@ -108,15 +108,14 @@ static void test_rle_overlong_run(void)
 static void test_rle_end_of_line(void)
 {
     struct mp_bd_palette_entry pal[256] = {0};
-    pal[0] = (struct mp_bd_palette_entry){0, 128, 128, 0};     // transparent
     pal[1] = (struct mp_bd_palette_entry){235, 128, 128, 255}; // opaque white
     uint32_t white = conv(235, 128, 128, 255);
 
-    // A zero-length run acts as an end-of-line marker: it must fill the rest of
-    // the row with its (here transparent) color rather than loop forever.
+    // A zero-length run terminates the current line. Pixels drawn before it are
+    // kept; the rest of the line is left to the caller's pre-cleared buffer.
     uint32_t buf[4];
     for (int i = 0; i < 4; i++)
-        buf[i] = 0xDEADBEEF;
+        buf[i] = 0;
     struct mp_bd_rle_elem rle[] = { {2, 1}, {0, 0} };
     mp_bd_decode_rle(buf, 4, 4, 1, pal, rle);
     assert_int_equal(buf[0], white);
@@ -125,11 +124,47 @@ static void test_rle_end_of_line(void)
     assert_int_equal(buf[3], 0);
 }
 
+// Regression for the "gray box" artifact: libbluray terminates every line with
+// a (len=0, color=0) end-of-line marker after runs that already sum to the full
+// width. The marker must advance to the next line, not be expanded as a run of
+// palette[0]. palette[0] here is deliberately OPAQUE so the buggy decoder (which
+// filled whole lines with it) is caught: those opaque lines are what blended
+// into gray rectangles behind the menu text.
+static void test_rle_multiline_eol(void)
+{
+    struct mp_bd_palette_entry pal[256] = {0};
+    pal[0] = (struct mp_bd_palette_entry){16, 128, 128, 255};  // OPAQUE (bug filler)
+    pal[1] = (struct mp_bd_palette_entry){0, 128, 128, 0};     // transparent
+    pal[2] = (struct mp_bd_palette_entry){235, 128, 128, 255}; // opaque white
+    uint32_t white = conv(235, 128, 128, 255);
+
+    // 3x3 region. Each line's runs sum to exactly w=3, then a (0,0) EOL marker,
+    // exactly as libbluray emits.
+    struct mp_bd_rle_elem rle[] = {
+        {3, 1}, {0, 0},                 // line 0: transparent
+        {1, 1}, {1, 2}, {1, 1}, {0, 0}, // line 1: transp, white, transp
+        {3, 1}, {0, 0},                 // line 2: transparent
+    };
+    uint32_t buf[9];
+    for (int i = 0; i < 9; i++)
+        buf[i] = 0xDEADBEEF;
+    mp_bd_decode_rle(buf, 3, 3, 3, pal, rle);
+
+    const uint32_t expect[9] = {
+        0,     0,     0,
+        0,     white, 0,
+        0,     0,     0,
+    };
+    for (int i = 0; i < 9; i++)
+        assert_int_equal(buf[i], expect[i]);
+}
+
 int main(void)
 {
     test_palette();
     test_rle_decode();
     test_rle_overlong_run();
     test_rle_end_of_line();
+    test_rle_multiline_eol();
     return 0;
 }
