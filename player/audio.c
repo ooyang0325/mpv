@@ -907,10 +907,11 @@ static void feed_menu_sfx_silence(struct MPContext *mpctx)
     if (!sfx || !ao_c || !ao_c->ao || !ao_c->queue_filter)
         return;
 
-    // Only step in when the program is not itself producing audio. In
-    // PLAYING/SYNCING/READY/DRAINING the normal ao_process() path overlays the
-    // effect on the flowing PCM; synthesizing here would displace or desync it.
-    bool quiet = mpctx->audio_status == STATUS_EOF;
+    // Only step in when the program is not itself producing audio. The disc-nav
+    // path can pause an otherwise-live AO during a silent hold; treat that as
+    // quiet too so a queued click effect can wake the AO through this queue.
+    bool quiet = mpctx->audio_status == STATUS_EOF ||
+                 mp_nav_audio_idle_active(mpctx);
 
     if (quiet && mp_bd_sfx_has_output(sfx)) {
         int rate = 0, format = 0;

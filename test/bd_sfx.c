@@ -28,6 +28,12 @@ static void test_route_predicate(void)
     assert_false(mp_bd_sfx_route_allows_mix(AF_FORMAT_S_DTSHD, false));
     assert_false(mp_bd_sfx_route_allows_mix(AF_FORMAT_S_TRUEHD, false));
     assert_false(mp_bd_sfx_route_allows_mix(AF_FORMAT_S_DOP, false));
+
+    // PCM layouts the mixer does not implement are rejected rather than
+    // retaining a pending clip forever.
+    assert_false(mp_bd_sfx_route_allows_mix(AF_FORMAT_U8, false));
+    assert_false(mp_bd_sfx_route_allows_mix(AF_FORMAT_DOUBLE, false));
+    assert_false(mp_bd_sfx_route_allows_mix(AF_FORMAT_FLOATP, false));
 }
 
 // Float mix domain: additive overlay, headroom attenuation, and saturation.

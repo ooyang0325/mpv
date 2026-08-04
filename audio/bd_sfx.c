@@ -302,12 +302,13 @@ void mp_bd_sfx_mix(struct mp_bd_sfx *sfx, struct mp_aframe *af,
 
 bool mp_bd_sfx_route_allows_mix(int out_format, bool ao_bit_exact)
 {
-    // af_fmt_is_pcm() is false for every IEC61937 passthrough format and for
-    // AF_FORMAT_S_DOP, so SPDIF and DoP are rejected here. ao_bit_exact covers
-    // the routes that still look like PCM at this stage but are carried
-    // bit-for-bit (PCM-to-DSD, non-mixable exclusive).
-    return af_fmt_is_pcm(out_format) && !af_fmt_is_spdif(out_format) &&
-           !ao_bit_exact;
+    // The mixer writes packed float/S16/S32 only. Reject other PCM layouts as
+    // well as passthrough/DoP; ao_bit_exact covers PCM-looking carriers such as
+    // PCM-to-DSD and non-mixable exclusive output.
+    bool supported = out_format == AF_FORMAT_FLOAT ||
+                     out_format == AF_FORMAT_S16 ||
+                     out_format == AF_FORMAT_S32;
+    return supported && !af_fmt_is_spdif(out_format) && !ao_bit_exact;
 }
 
 void mp_bd_sfx_mix_f32(float *dst, const float *src, int n, float gain)
