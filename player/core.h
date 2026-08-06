@@ -653,6 +653,7 @@ void mp_handle_nav(struct MPContext *mpctx);
 void mp_nav_user_input(struct MPContext *mpctx, const char *action);
 void mp_nav_destroy(struct MPContext *mpctx);
 bool mp_nav_menu_active(struct MPContext *mpctx);
+bool mp_nav_eof_hold_active(struct MPContext *mpctx);
 bool mp_nav_hold_active(struct MPContext *mpctx);
 bool mp_nav_wait_pending(struct MPContext *mpctx);
 bool mp_nav_audio_idle_active(struct MPContext *mpctx);

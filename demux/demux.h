@@ -240,6 +240,7 @@ typedef struct demuxer {
     bool fully_read;
     bool is_network; // opened directly from a network stream
     bool is_streaming; // implies a "slow" input, such as network or FUSE
+    double max_readahead_secs; // 0: use global byte/time limits
     int stream_origin; // any STREAM_ORIGIN_* (set from source stream)
     bool access_references; // allow opening other files/URLs
     int depth; // demuxer depth, 0 for top-level
@@ -320,6 +321,7 @@ void demux_start_thread(struct demuxer *demuxer);
 void demux_stop_thread(struct demuxer *demuxer);
 void demux_set_wakeup_cb(struct demuxer *demuxer, void (*cb)(void *ctx), void *ctx);
 void demux_start_prefetch(struct demuxer *demuxer);
+void demux_resume(struct demuxer *demuxer);
 
 bool demux_cancel_test(struct demuxer *demuxer);
 bool demux_read_interrupted(struct demuxer *demuxer);

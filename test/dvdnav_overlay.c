@@ -214,7 +214,7 @@ static void test_wait_phase(void)
     // No wait outstanding -> phase 0 regardless of the release flag.
     assert_int_equal(0, mp_nav_wait_phase(false, false));
     assert_int_equal(0, mp_nav_wait_phase(false, true));
-    // Waiting, not yet released by the player -> phase 1 (keep demuxer alive).
+    // Waiting, not yet released by the player -> phase 1.
     assert_int_equal(1, mp_nav_wait_phase(true, false));
     // Waiting and released -> phase 2 (stream may wait_skip and resume).
     assert_int_equal(2, mp_nav_wait_phase(true, true));
@@ -230,6 +230,14 @@ static void test_nav_hold(void)
     assert_true(mp_nav_hold(false, 5));
     // Not held while content plays (no menu, no still).
     assert_false(mp_nav_hold(false, 0));
+}
+
+static void test_nav_eof_hold(void)
+{
+    assert_true(mp_nav_eof_hold(false, true, false));
+    assert_true(mp_nav_eof_hold(true, false, true));
+    assert_false(mp_nav_eof_hold(true, false, false));
+    assert_false(mp_nav_eof_hold(false, false, true));
 }
 
 static void test_nav_audio_idle(void)
@@ -275,6 +283,7 @@ int main(void)
     test_wait_drained();
     test_wait_phase();
     test_nav_hold();
+    test_nav_eof_hold();
     test_nav_audio_idle();
     test_demux_drained();
     return 0;

@@ -21,6 +21,7 @@
  */
 
 #include <string.h>
+#include <math.h>
 
 #include "core.h"
 #include "command.h"
@@ -52,11 +53,15 @@ struct mp_nav_state {
 
     struct mp_nav_state_info st; // last polled snapshot (also read by properties)
     int applied_overlay_change_id;
+    int applied_reset_id;
     struct sub_bitmaps *authored; // owned, in authored coords, for re-scaling
     int overlay_w, overlay_h;     // authored size paired with `authored`
+    bool overlay_wait_for_video;
+    bool overlay_restart_seen;
     struct mp_osd_res last_res;
     bool audio_idled;             // AO is paused during a silent hold
     int audio_quiet_polls;        // consecutive polls the hold has been silent
+    bool eof_hold;                // transient menu EOF has not resumed media yet
 };
 
 // Return the disc stream if the current demuxer is a disc menu stream
@@ -145,14 +150,72 @@ void mp_handle_nav(struct MPContext *mpctx)
     }
     struct mp_nav_state *nav = mpctx->nav_state;
 
+    if (info.reset_id != nav->applied_reset_id) {
+        nav->applied_reset_id = info.reset_id;
+        demux_flush(mpctx->demuxer);
+        reset_playback_state(mpctx);
+        demux_start_prefetch(mpctx->demuxer);
+    }
+
+    struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
+    if (info.overlay_change_id != nav->applied_overlay_change_id) {
+        // Fetch bitmaps, their generation id and authored size together, and
+        // trust the fetched id: a publish between the state poll and this fetch
+        // cannot leave us applying a mismatched generation.
+        struct mp_nav_overlay ov = {0};
+        stream_control(s, STREAM_CTRL_GET_NAV_OVERLAY, &ov);
+        talloc_free(nav->authored);
+        nav->authored = talloc_steal(nav, ov.imgs); // may be NULL
+        nav->overlay_w = ov.w;
+        nav->overlay_h = ov.h;
+        nav->applied_overlay_change_id = ov.change_id;
+        nav->overlay_wait_for_video = ov.wait_for_video;
+        nav->overlay_restart_seen = !mpctx->restart_complete;
+        if (!nav->overlay_wait_for_video) {
+            apply_overlay(mpctx);
+            nav->last_res = res;
+        }
+    }
+
+    if (nav->overlay_wait_for_video) {
+        nav->overlay_restart_seen |= !mpctx->restart_complete;
+        if (nav->overlay_restart_seen && mpctx->video_status >= STATUS_READY &&
+            mpctx->video_status <= STATUS_PLAYING)
+        {
+            apply_overlay(mpctx);
+            nav->last_res = res;
+            nav->overlay_wait_for_video = false;
+            nav->overlay_restart_seen = false;
+        } else {
+            info.menu_active = false;
+            info.overlay_visible = false;
+            info.mouse_over_button = false;
+            mp_set_timeout(mpctx, 0.01);
+        }
+    } else if (nav->authored && !osd_res_equals(res, nav->last_res)) {
+        apply_overlay(mpctx);
+        nav->last_res = res;
+    }
+
     struct mp_nav_state_info old = nav->st;
     nav->st = info;
+    nav->eof_hold = mp_nav_eof_hold(nav->eof_hold,
+        mp_nav_hold(info.menu_active, info.still_seconds) || info.wait_pending,
+        mpctx->audio_status == STATUS_EOF && mpctx->video_status == STATUS_EOF);
     if (old.menu_active != info.menu_active)
         mp_notify_property(mpctx, "disc-menu-active");
     if (old.popup_available != info.popup_available)
         mp_notify_property(mpctx, "disc-menu-popup-available");
     if (old.mouse_over_button != info.mouse_over_button)
         mp_notify_property(mpctx, "disc-mouse-on-button");
+
+    double duration;
+    if (stream_control(s, STREAM_CTRL_GET_TIME_LENGTH, &duration) == STREAM_OK &&
+        duration >= 0 && duration != mpctx->demuxer->duration)
+    {
+        mpctx->demuxer->duration = duration;
+        mp_notify(mpctx, MP_EVENT_DURATION_UPDATE, NULL);
+    }
 
     // Idle the audio output only during a *genuinely silent* disc hold. A DVD
     // still, or a WAIT-parked / looping button menu with no program audio,
@@ -190,29 +253,12 @@ void mp_handle_nav(struct MPContext *mpctx)
         nav->audio_idled = false;
     }
 
-    struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
-    if (info.overlay_change_id != nav->applied_overlay_change_id) {
-        // Fetch bitmaps, their generation id and authored size together, and
-        // trust the fetched id: a publish between the state poll and this fetch
-        // cannot leave us applying a mismatched generation.
-        struct mp_nav_overlay ov = {0};
-        stream_control(s, STREAM_CTRL_GET_NAV_OVERLAY, &ov);
-        talloc_free(nav->authored);
-        nav->authored = talloc_steal(nav, ov.imgs); // may be NULL
-        nav->overlay_w = ov.w;
-        nav->overlay_h = ov.h;
-        nav->applied_overlay_change_id = ov.change_id;
-        apply_overlay(mpctx);
-        nav->last_res = res;
-    } else if (nav->authored && !osd_res_equals(res, nav->last_res)) {
-        apply_overlay(mpctx);
-        nav->last_res = res;
-    }
-
     // Poll promptly (but without busy-spinning) while a menu or still is shown,
     // so overlay animations and hover feedback stay responsive.
     if (info.menu_active || info.overlay_visible || info.still_seconds)
-        mp_set_timeout(mpctx, 0.05);
+        mp_set_timeout(mpctx, 0.02);
+    if (info.still_seconds > 0)
+        demux_resume(mpctx->demuxer);
 
     fetch_sound_effects(mpctx, s);
 }
@@ -263,7 +309,11 @@ void mp_nav_user_input(struct MPContext *mpctx, const char *action)
     struct stream *s = get_nav_stream(mpctx);
     if (!s)
         return;
-    struct mp_nav_cmd cmd = { .action = parse_action(action) };
+    struct mp_nav_cmd cmd = {
+        .action = parse_action(action),
+        .pts = mpctx->video_pts == MP_NOPTS_VALUE
+            ? -1 : llrint(mpctx->video_pts * 90000),
+    };
     if (cmd.action == MP_NAV_ACTION_NONE)
         return;
     if (cmd.action == MP_NAV_ACTION_MOUSE_MOVE ||
@@ -273,13 +323,19 @@ void mp_nav_user_input(struct MPContext *mpctx, const char *action)
         mp_input_get_mouse_pos(mpctx->input, &x, &y, &hover);
         window_to_authored(mpctx, x, y, &cmd.x, &cmd.y);
     }
-    stream_control(s, STREAM_CTRL_NAV_CMD, &cmd);
+    if (stream_control(s, STREAM_CTRL_NAV_CMD, &cmd) == STREAM_OK)
+        demux_resume(mpctx->demuxer);
     mp_wakeup_core(mpctx);
 }
 
 bool mp_nav_menu_active(struct MPContext *mpctx)
 {
     return mpctx->nav_state && mpctx->nav_state->st.menu_active;
+}
+
+bool mp_nav_eof_hold_active(struct MPContext *mpctx)
+{
+    return mpctx->nav_state && mpctx->nav_state->eof_hold;
 }
 
 // True while a disc menu or still is on screen, i.e. the disc stream is

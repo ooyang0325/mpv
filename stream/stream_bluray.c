@@ -26,8 +26,8 @@
  *
  */
 
-#include <string.h>
 #include <assert.h>
+#include <string.h>
 
 #include <libbluray/bluray.h>
 #include <libbluray/meta_data.h>
@@ -62,7 +62,7 @@
 #define BLURAY_NUM_OVERLAYS    2
 
 // Poll interval while waiting out a still frame, to avoid busy-spinning (ns).
-#define BLURAY_STILL_POLL_NS   (20 * 1000 * 1000)
+#define BLURAY_STILL_POLL_NS   (10 * 1000 * 1000)
 
 // Bound on authored menu sound effects buffered for the player. Rapid button
 // presses stay bounded: on overflow the oldest queued clip is dropped.
@@ -121,6 +121,9 @@ struct bluray_priv_s {
     int current_angle;
     int current_title;
     int current_playlist;
+    bool had_media_data;
+    int pending_chapter;
+    bool pending_chapter_from_menu;
 
     int cfg_title;
     int cfg_playlist;
@@ -130,6 +133,7 @@ struct bluray_priv_s {
     // following untouched.
     bool use_nav;
     struct mp_image_pool *pool;
+    mp_mutex bd_lock; // serializes libbluray reads and user input
 
     // Overlay planes and published bitmaps. Planes are only ever touched on the
     // demuxer read thread (inside the libbluray overlay callback / bd_read_ext).
@@ -139,8 +143,10 @@ struct bluray_priv_s {
     // Everything below is protected by nav_lock.
     mp_mutex nav_lock;
     struct sub_bitmaps *pending_overlay; // owned; handed to the player on demand
+    bool pending_overlay_wait;
     int overlay_change_id;
     int overlay_w, overlay_h;
+    double duration;
     bool overlay_visible;
     bool ig_visible;             // Interactive Graphics (menu) plane is on screen
     bool in_menu;
@@ -149,9 +155,14 @@ struct bluray_priv_s {
     uint32_t uo_mask;
     int still_length;            // 0: none, -1: infinite, >0: seconds
     bool reset_pending;          // nested demuxer should re-sync
-    struct mp_nav_cmd *cmd_queue;
-    int num_cmds;
+    int reset_id;
+    bool reset_hold;             // do not expose new bytes before reset ack
+    bool wait_pending;           // natural EOT is draining through the player
+    bool wait_release;
+    bool transition_overlay_pending;
     int mousex, mousey;
+    uint8_t *held_data;          // event-associated bytes replayed after reset
+    int held_len, held_pos;
 
     // Pending authored menu sound effects (BD_EVENT_SOUND_EFFECT). Copied out
     // of libbluray on this (stream) thread and drained by the player through
@@ -214,6 +225,13 @@ static void overlay_close_all(struct bluray_priv_s *b)
 {
     for (int i = 0; i < BLURAY_NUM_OVERLAYS; i++)
         overlay_plane_release(&b->planes[i]);
+}
+
+static bool overlay_rect_valid(struct bluray_overlay_plane *plane,
+                               const BD_OVERLAY *bo)
+{
+    return plane->image && bo->x <= plane->w && bo->y <= plane->h &&
+           bo->w <= plane->w - bo->x && bo->h <= plane->h - bo->y;
 }
 
 // Build a fresh sub_bitmaps snapshot (in authored coordinates) from the visible
@@ -301,6 +319,8 @@ static void publish_overlay(struct bluray_priv_s *b)
         imgs->change_id = id;
     talloc_free(b->pending_overlay);
     b->pending_overlay = imgs;
+    b->pending_overlay_wait = b->transition_overlay_pending;
+    b->transition_overlay_pending = false;
     b->overlay_visible = imgs != NULL;
     b->ig_visible = ig_visible;
     if (w > 0 && h > 0) {
@@ -338,7 +358,7 @@ static void overlay_process(void *data, const BD_OVERLAY *const bo)
         }
         break;
     case BD_OVERLAY_DRAW: {
-        if (!plane->image || !bo->img || !bo->palette)
+        if (!overlay_rect_valid(plane, bo) || !bo->img || !bo->palette)
             break;
         int stride_px = plane->image->stride[0] / 4;
         uint32_t *origin = (uint32_t *)plane->image->planes[0];
@@ -351,7 +371,7 @@ static void overlay_process(void *data, const BD_OVERLAY *const bo)
         break;
     }
     case BD_OVERLAY_WIPE: {
-        if (!plane->image)
+        if (!overlay_rect_valid(plane, bo))
             break;
         int stride_px = plane->image->stride[0] / 4;
         uint32_t *origin = (uint32_t *)plane->image->planes[0];
@@ -386,7 +406,7 @@ static bd_vk_key_e nav_action_to_vk(enum mp_nav_action action)
 // the BLURAY* VM is only ever touched from one thread.
 static void apply_nav_command(struct bluray_priv_s *b, struct mp_nav_cmd *cmd)
 {
-    const int64_t pts = -1; // "current position"
+    const int64_t pts = cmd->pts;
     bd_vk_key_e key = nav_action_to_vk(cmd->action);
     if (key != BD_VK_NONE) {
         bd_user_input(b->bd, pts, key);
@@ -428,21 +448,6 @@ static void apply_nav_command(struct bluray_priv_s *b, struct mp_nav_cmd *cmd)
     }
 }
 
-// Drain and apply all queued navigation commands (demuxer read thread).
-static void drain_nav_commands(struct bluray_priv_s *b)
-{
-    mp_mutex_lock(&b->nav_lock);
-    struct mp_nav_cmd *queue = b->cmd_queue;
-    int num = b->num_cmds;
-    b->cmd_queue = NULL;
-    b->num_cmds = 0;
-    mp_mutex_unlock(&b->nav_lock);
-
-    for (int i = 0; i < num; i++)
-        apply_nav_command(b, &queue[i]);
-    talloc_free(queue);
-}
-
 static void bluray_stream_close(stream_t *s)
 {
     struct bluray_priv_s *priv = s->priv;
@@ -451,17 +456,19 @@ static void bluray_stream_close(stream_t *s)
 
     if (priv->title_info)
         bd_free_title_info(priv->title_info);
-    if (priv->bd)
-        bd_close(priv->bd);
     if (priv->use_nav) {
+        if (priv->bd)
+            bd_register_overlay_proc(priv->bd, NULL, NULL);
         overlay_close_all(priv);
         talloc_free(priv->pending_overlay);
-        talloc_free(priv->cmd_queue);
         talloc_free(priv->pool);
         for (int n = 0; n < BLURAY_MAX_PENDING_SFX; n++)
             talloc_free(priv->sfx_queue[n].samples);
+        mp_mutex_destroy(&priv->bd_lock);
         mp_mutex_destroy(&priv->nav_lock);
     }
+    if (priv->bd)
+        bd_close(priv->bd);
 }
 
 #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 9, 0)
@@ -537,12 +544,21 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         break;
     case BD_EVENT_END_OF_TITLE:
         if (b->use_nav) {
-            overlay_close_all(b);
-            publish_overlay(b);
+            mp_mutex_lock(&b->nav_lock);
+            b->wait_pending = true;
+            b->wait_release = false;
+            mp_mutex_unlock(&b->nav_lock);
         }
         break;
     case BD_EVENT_PLAYLIST:
         b->current_playlist = ev->param;
+#if HAVE_LIBBLURAY_GPR
+        if (b->pending_chapter_from_menu) {
+            uint32_t chapter = bd_get_gpr(b->bd, 3);
+            b->pending_chapter = chapter > 0 ? chapter : -1;
+            b->pending_chapter_from_menu = false;
+        }
+#endif
         if (!b->use_nav)
             b->current_title = bd_get_current_title(b->bd);
         if (b->title_info)
@@ -551,25 +567,53 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
                                              b->current_angle);
         if (b->use_nav) {
             mp_mutex_lock(&b->nav_lock);
+            b->duration = b->title_info
+                ? BD_TIME_TO_MP(b->title_info->duration) : -1;
+            mp_mutex_unlock(&b->nav_lock);
+        }
+        if (b->pending_chapter >= 0 && b->title_info &&
+            b->pending_chapter < b->title_info->chapter_count)
+        {
+            bd_seek_chapter(b->bd, b->pending_chapter);
+            b->pending_chapter = -1;
+        }
+        if (b->use_nav && b->had_media_data) {
+            mp_mutex_lock(&b->nav_lock);
+            if (!b->reset_pending)
+                b->reset_id++;
             b->reset_pending = true;
+            b->reset_hold = true;
+            b->transition_overlay_pending = true;
+            if (b->pending_overlay)
+                b->pending_overlay_wait = true;
             mp_mutex_unlock(&b->nav_lock);
         }
         break;
-    case BD_EVENT_TITLE:
+    case BD_EVENT_TITLE: {
+#if HAVE_LIBBLURAY_GPR
+        int old_title = b->current_title;
+#endif
         if (ev->param == BLURAY_TITLE_FIRST_PLAY) {
             b->current_title = bd_get_current_title(b->bd);
         } else
             b->current_title = ev->param;
+#if HAVE_LIBBLURAY_GPR
+        // ponytail: some HDMV menus hand a zero-based chapter through GPR3
+        // immediately before the following PLAYLIST event.
+        b->pending_chapter_from_menu =
+            old_title == BLURAY_TITLE_TOP_MENU && b->current_title > 0;
+#endif
         if (b->title_info) {
             bd_free_title_info(b->title_info);
             b->title_info = NULL;
         }
         if (b->use_nav) {
             mp_mutex_lock(&b->nav_lock);
-            b->reset_pending = true;
+            b->duration = -1;
             mp_mutex_unlock(&b->nav_lock);
         }
         break;
+    }
     case BD_EVENT_ANGLE:
         b->current_angle = ev->param;
         if (b->title_info) {
@@ -596,9 +640,12 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
 #endif
 #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 5, 0)
     case BD_EVENT_DISCONTINUITY:
-        if (b->use_nav) {
+        if (b->use_nav && b->had_media_data) {
             mp_mutex_lock(&b->nav_lock);
+            if (!b->reset_pending)
+                b->reset_id++;
             b->reset_pending = true;
+            b->reset_hold = true;
             mp_mutex_unlock(&b->nav_lock);
         }
         break;
@@ -608,9 +655,12 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
     case BD_EVENT_SEEK:
         // Both cross a media boundary within the same navigation session and
         // require the nested demuxer to flush and re-sync.
-        if (b->use_nav) {
+        if (b->use_nav && b->had_media_data) {
             mp_mutex_lock(&b->nav_lock);
+            if (!b->reset_pending)
+                b->reset_id++;
             b->reset_pending = true;
+            b->reset_hold = true;
             mp_mutex_unlock(&b->nav_lock);
         }
         break;
@@ -644,22 +694,64 @@ static int bdnav_stream_fill_buffer(stream_t *s, void *buf, int len)
     struct bluray_priv_s *b = s->priv;
     int64_t still_start = 0;
     for (;;) {
-        drain_nav_commands(b);
+        mp_mutex_lock(&b->nav_lock);
+        bool reset_hold = b->reset_hold;
+        bool wait_pending = b->wait_pending;
+        bool wait_release = b->wait_release;
+        mp_mutex_unlock(&b->nav_lock);
+        if (reset_hold || (wait_pending && !wait_release))
+            return 0;
+        if (wait_pending) {
+            mp_mutex_lock(&b->nav_lock);
+            b->wait_pending = false;
+            b->wait_release = false;
+            mp_mutex_unlock(&b->nav_lock);
+        }
+
+        if (b->held_data) {
+            int copy = MPMIN(len, b->held_len - b->held_pos);
+            memcpy(buf, b->held_data + b->held_pos, copy);
+            b->held_pos += copy;
+            if (b->held_pos == b->held_len) {
+                talloc_free(b->held_data);
+                b->held_data = NULL;
+                b->held_len = b->held_pos = 0;
+            }
+            return copy;
+        }
 
         BD_EVENT event;
+        mp_mutex_lock(&b->bd_lock);
         int read = bd_read_ext(b->bd, (unsigned char *)buf, len, &event);
-        if (read < 0)
+        if (read < 0) {
+            mp_mutex_unlock(&b->bd_lock);
             return -1;
-
+        }
         // Always process a pending event, even when data was also returned, so
         // menu-state changes and resets are never dropped. The nested demuxer's
         // reset handshake (demux_disc) discards any packet that straddles the
         // resulting transition.
         if (event.event != BD_EVENT_NONE)
             handle_event(s, &event);
+        mp_mutex_unlock(&b->bd_lock);
 
-        if (read > 0)
+        mp_mutex_lock(&b->nav_lock);
+        reset_hold = b->reset_hold;
+        mp_mutex_unlock(&b->nav_lock);
+        if (reset_hold) {
+            if (read > 0) {
+                talloc_free(b->held_data);
+                b->held_data = talloc_memdup(b, buf, read);
+                b->held_len = read;
+                b->held_pos = 0;
+            }
+            return 0;
+        }
+
+        if (read > 0) {
+            b->had_media_data = true;
             return read;
+        }
 
         // read == 0: no data was produced this call.
 #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 9, 0)
@@ -754,6 +846,15 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_TIME_LENGTH: {
+        if (b->use_nav) {
+            mp_mutex_lock(&b->nav_lock);
+            double duration = b->duration;
+            mp_mutex_unlock(&b->nav_lock);
+            if (duration < 0)
+                return STREAM_UNSUPPORTED;
+            *((double *)arg) = duration;
+            return STREAM_OK;
+        }
         const BLURAY_TITLE_INFO *ti = b->title_info;
         if (!ti)
             return STREAM_UNSUPPORTED;
@@ -851,25 +952,28 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
     case STREAM_CTRL_NAV_CMD: {
         if (!b->use_nav)
             return STREAM_UNSUPPORTED;
-        struct mp_nav_cmd *in = arg;
-        mp_mutex_lock(&b->nav_lock);
-        MP_TARRAY_APPEND(b, b->cmd_queue, b->num_cmds, *in);
-        mp_mutex_unlock(&b->nav_lock);
+        mp_mutex_lock(&b->bd_lock);
+        apply_nav_command(b, arg);
+        mp_mutex_unlock(&b->bd_lock);
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_NAV_STATE: {
         if (!b->use_nav)
             return STREAM_UNSUPPORTED;
         struct mp_nav_state_info *out = arg;
+        mp_mutex_lock(&b->bd_lock);
         mp_mutex_lock(&b->nav_lock);
         *out = (struct mp_nav_state_info){
             // The IG plane being on screen counts as an active menu even if
             // BD_EVENT_MENU was not (yet) delivered, so callers can route arrow
             // keys to the menu instead of seeking.
             .menu_active = b->in_menu || b->ig_visible,
+            .menu_transport = b->current_title == BLURAY_TITLE_TOP_MENU,
             .popup_available = b->popup_available,
             .mouse_over_button = b->mouse_over_button,
             .overlay_visible = b->overlay_visible,
+            .wait_pending = b->wait_pending,
+            .reset_id = b->reset_id,
             .still_seconds = b->still_length,
             .uo_mask = b->uo_mask,
             .overlay_w = b->overlay_w,
@@ -877,12 +981,14 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
             .overlay_change_id = b->overlay_change_id,
         };
         mp_mutex_unlock(&b->nav_lock);
+        mp_mutex_unlock(&b->bd_lock);
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_NAV_OVERLAY: {
         if (!b->use_nav)
             return STREAM_UNSUPPORTED;
         struct mp_nav_overlay *out = arg;
+        mp_mutex_lock(&b->bd_lock);
         mp_mutex_lock(&b->nav_lock);
         // Bitmaps, their generation id and the authored size are read together
         // so the consumer applies a self-consistent generation.
@@ -891,7 +997,9 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         out->change_id = b->overlay_change_id;
         out->w = b->overlay_w;
         out->h = b->overlay_h;
+        out->wait_for_video = b->pending_overlay_wait;
         mp_mutex_unlock(&b->nav_lock);
+        mp_mutex_unlock(&b->bd_lock);
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_NAV_RESET: {
@@ -902,6 +1010,35 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         b->reset_pending = false;
         mp_mutex_unlock(&b->nav_lock);
         return pending ? STREAM_OK : STREAM_UNSUPPORTED;
+    }
+    case STREAM_CTRL_NAV_RESET_DONE: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&b->nav_lock);
+        bool held = b->reset_hold;
+        b->reset_hold = false;
+        mp_mutex_unlock(&b->nav_lock);
+        return held ? STREAM_OK : STREAM_UNSUPPORTED;
+    }
+    case STREAM_CTRL_NAV_WAIT_DONE: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&b->nav_lock);
+        bool waiting = b->wait_pending;
+        if (waiting)
+            b->wait_release = true;
+        mp_mutex_unlock(&b->nav_lock);
+        return waiting ? STREAM_OK : STREAM_UNSUPPORTED;
+    }
+    case STREAM_CTRL_GET_NAV_WAIT: {
+        if (!b->use_nav)
+            return STREAM_UNSUPPORTED;
+        mp_mutex_lock(&b->nav_lock);
+        bool waiting = b->wait_pending, released = b->wait_release;
+        mp_mutex_unlock(&b->nav_lock);
+        if (arg)
+            *(int *)arg = mp_nav_wait_phase(waiting, released);
+        return STREAM_OK;
     }
     case STREAM_CTRL_GET_NAV_SOUND: {
         if (!b->use_nav)
@@ -1059,6 +1196,8 @@ static int bluray_stream_open_internal(stream_t *s)
     b->use_nav = b->cfg_title == BLURAY_MENU_TITLE;
     if (b->use_nav) {
         mp_mutex_init(&b->nav_lock);
+        mp_mutex_init(&b->bd_lock);
+        b->duration = -1;
         b->pool = mp_image_pool_new(b);
     }
 
@@ -1096,18 +1235,21 @@ static int bluray_stream_open_internal(stream_t *s)
     bd_get_event(bd, NULL);
 
     if (b->use_nav) {
+        bd_register_overlay_proc(bd, s, overlay_process);
         if (bd_play(bd)) {
-            bd_register_overlay_proc(bd, s, overlay_process);
         } else {
             // Authored navigation couldn't start (e.g. BD-J-only disc). Fall
             // back to direct main-title playback instead of failing the open.
             MP_WARN(s, "Couldn't start Blu-ray navigation; "
                        "falling back to direct title playback.\n");
             b->use_nav = false;
+            bd_register_overlay_proc(bd, NULL, NULL);
+            mp_mutex_destroy(&b->bd_lock);
             mp_mutex_destroy(&b->nav_lock);
             talloc_free(b->pool);
             b->pool = NULL;
             b->cfg_title = BLURAY_DEFAULT_TITLE;
+            b->pending_chapter = -1;
             select_initial_title(s, bd_get_main_title(bd));
         }
     } else {

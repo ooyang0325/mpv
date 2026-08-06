@@ -1253,6 +1253,20 @@ void demux_start_prefetch(struct demuxer *demuxer)
     mp_mutex_unlock(&in->lock);
 }
 
+void demux_resume(struct demuxer *demuxer)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_assert(demuxer == in->d_user);
+
+    mp_mutex_lock(&in->lock);
+    for (int n = 0; n < in->num_streams; n++)
+        in->streams[n]->ds->eof = false;
+    in->eof = false;
+    in->reading = true;
+    mp_cond_signal(&in->wakeup);
+    mp_mutex_unlock(&in->lock);
+}
+
 const char *stream_type_name(enum stream_type type)
 {
     switch (type) {
@@ -2275,10 +2289,13 @@ static bool read_packet(struct demux_internal *in)
     // the minimum, or if a stream explicitly needs new packets. Also includes
     // safe-guards against packet queue overflow.
     bool read_more = false, prefetch_more = false, refresh_more = false;
+    bool have_eager = false;
+    bool reached_time_limit = in->d_thread->max_readahead_secs > 0;
     uint64_t total_fw_bytes = 0;
     for (int n = 0; n < in->num_streams; n++) {
         struct demux_stream *ds = in->streams[n]->ds;
         if (ds->eager) {
+            have_eager = true;
             read_more |= !ds->reader_head;
             if (in->back_demuxing)
                 read_more |= ds->back_restarting || ds->back_resuming;
@@ -2300,8 +2317,20 @@ static bool read_packet(struct demux_internal *in)
             if (!in->hyst_active)
                 prefetch_more |= ds->queue->last_ts - ds->base_ts < in->min_secs;
         }
+        if (ds->eager && ds->reader_head && ds->queue->last_ts != MP_NOPTS_VALUE &&
+            ds->base_ts != MP_NOPTS_VALUE && ds->queue->last_ts >= ds->base_ts)
+        {
+            reached_time_limit &=
+                ds->queue->last_ts - ds->base_ts >=
+                in->d_thread->max_readahead_secs;
+        } else if (ds->eager) {
+            reached_time_limit = false;
+        }
         total_fw_bytes += get_forward_buffered_bytes(ds);
     }
+
+    if (have_eager && reached_time_limit && !read_more)
+        return false;
 
     if (in->hyst_bytes > 0 && total_fw_bytes <= in->hyst_bytes) {
         in->hyst_active = false;

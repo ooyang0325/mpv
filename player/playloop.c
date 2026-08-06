@@ -678,7 +678,7 @@ static void handle_osd_redraw(struct MPContext *mpctx)
         return;
     // If we're playing normally, let OSD be redrawn naturally as part of
     // video display.
-    if (!mpctx->paused) {
+    if (!mpctx->paused && !mp_nav_hold_active(mpctx)) {
         if (mpctx->sleeptime < 0.1 && mpctx->video_status == STATUS_PLAYING)
             return;
     }
@@ -788,15 +788,19 @@ static void handle_update_cache(struct MPContext *mpctx)
         bool have_a = mpctx->ao && mpctx->ao_chain, have_v = !!mpctx->vo_chain;
         bool a_drained = have_a && (mpctx->ao_chain->ao_underrun ||
                                     mp_nav_audio_idle_active(mpctx));
-        bool v_drained = have_v && mpctx->vo_chain->underrun_signaled;
+        bool v_drained = have_v && (mpctx->vo_chain->underrun_signaled ||
+                                    !vo_still_displaying(mpctx->video_out));
         // s.underrun is forced false for an unthreaded demuxer, so also treat an
         // empty forward queue as drained (thread-independent); the outputs must
         // still have presented everything either way.
         bool demux_drained = mp_nav_demux_drained(s.underrun, s.fw_bytes);
-        if (mp_nav_wait_drained(demux_drained, have_a, a_drained, have_v, v_drained))
-            stream_control(mpctx->demuxer->stream, STREAM_CTRL_NAV_WAIT_DONE, NULL);
-        else
+        if (mp_nav_wait_drained(demux_drained, have_a, a_drained, have_v, v_drained)) {
+            if (stream_control(mpctx->demuxer->stream,
+                               STREAM_CTRL_NAV_WAIT_DONE, NULL) == STREAM_OK)
+                demux_resume(mpctx->demuxer);
+        } else {
             mp_set_timeout(mpctx, 0.02); // poll the drain promptly (not a timer)
+        }
     }
 
     if (mpctx->paused_for_cache != need_wait) {
@@ -1280,6 +1284,7 @@ static void handle_eof(struct MPContext *mpctx)
     if ((mpctx->ao_chain || mpctx->vo_chain) && !prevent_eof &&
         mpctx->audio_status == STATUS_EOF &&
         mpctx->video_status == STATUS_EOF &&
+        !mp_nav_eof_hold_active(mpctx) &&
         !mpctx->stop_play)
     {
         mpctx->stop_play = AT_END_OF_FILE;

@@ -419,6 +419,17 @@ bool mp_load_playback_resume(struct MPContext *mpctx, const char *file)
     bool resume = false;
     if (!mpctx->opts->position_resume)
         return resume;
+    // Authored navigation must run First Play from the beginning.
+    const char *menu_protocols[] = {
+        "bd://menu", "br://menu", "bluray://menu",
+        "dvd://menu", "dvdnav://menu",
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(menu_protocols); n++) {
+        size_t len = strlen(menu_protocols[n]);
+        if (strncmp(file, menu_protocols[n], len) == 0 &&
+            (file[len] == '\0' || file[len] == '/'))
+            return resume;
+    }
     char *fname = mp_get_playback_resume_config_filename(mpctx, file);
     if (fname && mp_path_exists(fname)) {
         if (mpctx->opts->position_check_mtime &&

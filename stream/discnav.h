@@ -30,10 +30,12 @@
 // Retrieved via STREAM_CTRL_GET_NAV_STATE.
 struct mp_nav_state_info {
     bool menu_active;        // an HDMV interactive menu is on screen
+    bool menu_transport;     // transport is a menu playlist, not feature video
     bool popup_available;    // a popup menu can be toggled (BD_EVENT_POPUP)
     bool mouse_over_button;  // last mouse position was over a menu button
     bool overlay_visible;    // a menu overlay is currently displayed
     bool wait_pending;       // stream parked at a DVDNAV_WAIT sync point
+    int reset_id;            // incremented for each hard media boundary
     int still_seconds;       // 0: none, -1: infinite still, >0: timed still
     uint32_t uo_mask;        // BLURAY_UO_* mask of prohibited operations
     int overlay_w, overlay_h; // authored overlay plane resolution (for scaling)
@@ -57,8 +59,8 @@ static inline bool mp_nav_wait_drained(bool demux_empty,
 }
 
 // DVDNAV_WAIT handshake phase reported by the stream to the nested demuxer
-// (STREAM_CTRL_GET_NAV_WAIT), so the demuxer can keep itself alive without EOF
-// while the player drains, then resume once released. Pure/inline for testing.
+// (STREAM_CTRL_GET_NAV_WAIT), so the demuxer can resume after a transient EOF
+// once the player has drained and released it. Pure/inline for testing.
 //   0 = no wait outstanding
 //   1 = waiting (player still draining to the WAIT boundary)
 //   2 = released (player drained; the stream may run dvdnav_wait_skip and resume)
@@ -87,6 +89,13 @@ static inline bool mp_nav_demux_drained(bool demux_underrun, int64_t fw_bytes)
 static inline bool mp_nav_hold(bool menu_active, int still_seconds)
 {
     return menu_active || still_seconds != 0;
+}
+
+// Keep a resumable disc-menu EOF from becoming the file's real EOF during the
+// brief handoff from a held menu to the first frame of the selected title.
+static inline bool mp_nav_eof_hold(bool held, bool nav_hold, bool outputs_eof)
+{
+    return nav_hold || (held && outputs_eof);
 }
 
 // Whether the player should idle (deselect) the audio output during a disc
@@ -122,6 +131,7 @@ enum mp_nav_action {
 struct mp_nav_cmd {
     enum mp_nav_action action;
     int x, y; // authored (overlay-plane) coordinates for mouse actions
+    int64_t pts; // last presented title-relative 90 kHz video PTS, or -1
 };
 
 // Generic prohibited-operation flags exposed in mp_nav_state_info.uo_mask.
@@ -150,6 +160,7 @@ struct mp_nav_overlay {
     struct sub_bitmaps *imgs; // owned by caller after fetch; NULL clears/none
     int change_id;            // generation of imgs (and of the current overlay)
     int w, h;                 // authored overlay-plane resolution for scaling
+    bool wait_for_video;      // show with the first frame after a playlist reset
 };
 
 #endif // MP_STREAM_DISCNAV_H

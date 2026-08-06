@@ -46,18 +46,10 @@ struct priv {
     double base_dts;    // packet DTS that maps to base_time
     double last_dts;    // DTS of previously demuxed packet
     bool seek_reinit;   // needs reinit after seek
+    bool nav_segmented;
+    double nav_segment_start;
     bool in_nav_wait;   // parked at a DVDNAV_WAIT drain handshake (no slave read)
     int nav_wait_recover; // >0: pumping the slave for the first post-WAIT packet
-
-    // A DVD menu parks (DVDNAV_WAIT/still) with no trailing frame, so the
-    // authored menu-background keyframe stays stuck in the video decoder's
-    // reorder / frame-thread pipeline and the VO shows the previous (intro)
-    // frame. Cache the last authored video keyframe and re-inject a bounded
-    // burst of copies per menu hold to flush the held frame out of the decoder
-    // (a well-known DVD still technique), without EOF so the single live
-    // navigation VM keeps running.
-    struct demux_packet *still_flush_pkt; // owned copy of last video keyframe
-    int still_flush_count;                // dups injected for the current hold
 
     bool is_dvd, is_cdda;
 };
@@ -66,11 +58,6 @@ struct priv {
 // a reset. It should be big enough to account for 1. low video framerates and
 // large audio frames, and 2. bad interleaving.
 #define DTS_RESET_THRESHOLD 5.0
-
-// Number of duplicate keyframes injected to flush a parked menu's held frame
-// out of the decoder. Sized to cover avcodec's maximum automatic frame-thread
-// depth (16) plus the reorder/output delay.
-#define STILL_FLUSH_FRAMES 20
 
 static void reselect_streams(demuxer_t *demuxer)
 {
@@ -245,6 +232,10 @@ static void reset_pts(demuxer_t *demuxer)
 
     p->base_dts = p->last_dts = MP_NOPTS_VALUE;
     p->base_time = base;
+    struct mp_nav_state_info nav;
+    p->nav_segmented =
+        stream_control(demuxer->stream, STREAM_CTRL_GET_NAV_STATE, &nav) == STREAM_OK;
+    p->nav_segment_start = base;
     p->seek_reinit = false;
 }
 
@@ -262,6 +253,17 @@ static void nav_flush_slave(struct demuxer *demuxer)
     p->seek_reinit = true;
 }
 
+static void nav_recover_slave(struct demuxer *demuxer);
+
+static bool nav_reset_done(struct demuxer *demuxer)
+{
+    if (stream_control(demuxer->stream, STREAM_CTRL_NAV_RESET_DONE, NULL) !=
+        STREAM_OK)
+        return false;
+    nav_recover_slave(demuxer);
+    return true;
+}
+
 // Query the disc stream's DVDNAV_WAIT phase: 0 none, 1 waiting (player still
 // draining), 2 released (player drained, VM may continue). The poll also lets
 // the stream service menu input and republish a dirty highlight overlay on this
@@ -274,9 +276,8 @@ static int nav_wait_state(struct demuxer *demuxer)
     return st;
 }
 
-// Whether the disc is currently showing an authored button menu. Used to gate
-// the still-frame flush injection to menu holds only (a title's transient WAITs
-// are followed by real frames that flush the decoder naturally).
+// Whether the disc is currently showing an authored button menu. DVD menu
+// boundaries preserve the first packet because a still may have no second frame.
 static bool nav_menu_active(struct demuxer *demuxer)
 {
     struct mp_nav_state_info info;
@@ -298,55 +299,25 @@ static void nav_recover_slave(struct demuxer *demuxer)
     if (p->slave->desc && p->slave->desc->name &&
         strcmp(p->slave->desc->name, "lavf") == 0)
         demux_lavf_clear_eof(p->slave);
-    demux_start_prefetch(p->slave); // re-enable in->reading after the transient EOF
+    demux_resume(p->slave);
 }
 
 static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt)
 {
     struct priv *p = demuxer->priv;
+    struct mp_nav_state_info nav;
+    if (stream_control(demuxer->stream, STREAM_CTRL_GET_NAV_STATE, &nav) ==
+        STREAM_OK)
+        demuxer->max_readahead_secs = nav.menu_transport ? 0.5 : 0;
 
     // DVDNAV_WAIT drain handshake (see stream_dvdnav.c). While the disc VM is
     // parked at a WAIT, the outer stream yields no data and the slave's AVIO is
-    // at a transient EOF. Report "no packet, not EOF" so the demuxer stays alive
-    // and the player can present the already-buffered packets and drain to the
-    // WAIT boundary -- without this thread being trapped in the outer stream's
-    // read (which starved the VO). Don't read the slave until the player
-    // releases us; then clear the slave EOF and resume the same stream.
+    // at a transient EOF. Let the player drain and present buffered packets,
+    // then clear the resumable EOF after the player releases the WAIT.
     if (p->in_nav_wait) {
         int w = nav_wait_state(demuxer);
-        if (w == 1) {
-            // A DVD menu parks here with no trailing frame, so the authored
-            // menu-background keyframe stays stuck in the video decoder's reorder
-            // / frame-thread pipeline and the VO keeps showing the previous
-            // (intro) frame. Push it out by re-injecting copies of the last
-            // authored keyframe with advanced, monotonic timestamps: enough to
-            // cover the decoder's frame-threading depth (avcodec caps auto
-            // threads at 16) so the held frame is emitted. All copies decode to
-            // the same image, so the menu just shows it. Only for button menus (a
-            // title's transient WAITs are followed by real frames that flush the
-            // decoder on their own); reset when real video flows again. No EOF, so
-            // the single live navigation VM keeps running and the menu stays
-            // interactive.
-            if (p->still_flush_pkt &&
-                p->still_flush_pkt->pts != MP_NOPTS_VALUE &&
-                p->still_flush_count < STILL_FLUSH_FRAMES &&
-                nav_menu_active(demuxer))
-            {
-                int n = ++p->still_flush_count;
-                struct demux_packet *dup =
-                    demux_copy_packet(demuxer->packet_pool, p->still_flush_pkt);
-                if (dup) {
-                    dup->pts = p->still_flush_pkt->pts + 0.04 * n;
-                    dup->dts = p->still_flush_pkt->dts != MP_NOPTS_VALUE
-                               ? p->still_flush_pkt->dts + 0.04 * n : dup->pts;
-                    dup->keyframe = true;
-                    *out_pkt = dup;
-                    return true;
-                }
-            }
-            mp_sleep_ns(MP_TIME_MS_TO_NS(10));
-            return true; // *out_pkt stays NULL: retry after the player drains
-        }
+        if (w == 1)
+            return false; // transient EOF drains the decoder and video lookahead
         p->in_nav_wait = false;
         p->nav_wait_recover = 256; // pump the slave for the first post-WAIT packet
         nav_recover_slave(demuxer);
@@ -357,18 +328,34 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
     // recreating the stream, so the live navigation VM is preserved. A reset
     // may have been flagged during a previous read.
     bool reset = nav_reset_pending(demuxer);
-    if (reset)
-        nav_flush_slave(demuxer);
+    if (reset) {
+        bool entering_menu = p->is_dvd && nav_menu_active(demuxer);
+        if (entering_menu)
+            p->seek_reinit = true;
+        else {
+            nav_flush_slave(demuxer);
+            if (nav_reset_done(demuxer))
+                p->nav_wait_recover = 256;
+        }
+    }
 
     struct demux_packet *pkt = demux_read_any_packet(p->slave);
 
-    // The transition event is emitted by the stream *during* the read above, so
-    // the packet we just got straddles the boundary. Drop it and re-read once
-    // (no loop) after flushing, so only post-transition data is exposed.
+    // Blu-ray transition events can straddle the packet returned by the read, so
+    // drop that packet and re-read after flushing. libdvdnav emits its VTS event
+    // before returning the first packet of the new menu; preserve that packet
+    // because a still menu may have no second video frame.
     if (!reset && nav_reset_pending(demuxer)) {
-        nav_flush_slave(demuxer);
-        talloc_free(pkt);
-        pkt = demux_read_any_packet(p->slave);
+        bool entering_menu = p->is_dvd && nav_menu_active(demuxer);
+        if (entering_menu) {
+            p->seek_reinit = true;
+        } else {
+            nav_flush_slave(demuxer);
+            talloc_free(pkt);
+            if (nav_reset_done(demuxer))
+                p->nav_wait_recover = 256;
+            pkt = demux_read_any_packet(p->slave);
+        }
     }
 
     if (!pkt) {
@@ -376,29 +363,12 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
         // (EOF to libavformat) but that is a navigation sync point, not real EOF.
         int w = nav_wait_state(demuxer);
         if (w != 0) {
-            if (demux_is_threaded(demuxer)) {
-                // Threaded: keep the demuxer alive (no EOF) so the player can
-                // present the already-buffered packets and drain to the WAIT
-                // boundary; the playloop releases the wait once its FIFOs drain,
-                // then we recover and resume reading (top of this function). The
-                // authored still-frame flush happens in the in_nav_wait hold at
-                // the top of this function (that is where a menu actually parks).
-                p->in_nav_wait = true;
-                p->nav_wait_recover = 0;
-                return true;
-            }
-            // Unthreaded (--demuxer-thread=no): the player drives this read in a
-            // synchronous loop and cannot drain asynchronously, so "no packet,
-            // not EOF" would spin forever (demux_read_packet_async_until()) and
-            // reader_state.underrun is forced false. Take the explicit
-            // non-threaded release path here: the drained slave queue *is* the
-            // boundary, and the already-decoded output FIFOs still present in
-            // order, so release now (not on a timer), recover, and read the
-            // post-WAIT block on the next pass.
-            stream_control(demuxer->stream, STREAM_CTRL_NAV_WAIT_DONE, NULL);
-            nav_recover_slave(demuxer);
-            p->nav_wait_recover = 256;
-            return true;
+            // MP_FRAME_EOF is resumable. Let it drain the decoder and player's
+            // one-frame video lookahead; the playloop restarts this demuxer once
+            // the WAIT is released or navigation input arrives.
+            p->in_nav_wait = true;
+            p->nav_wait_recover = 0;
+            return false;
         }
         // Just resumed after a WAIT: demux_read_any_packet() returns NULL on the
         // call that merely *queues* the first post-WAIT packet (its all-eof
@@ -468,19 +438,14 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
         if (pkt->dts != MP_NOPTS_VALUE)
             pkt->dts += delta;
     }
+    if (p->nav_segmented) {
+        pkt->segmented = true;
+        pkt->codec = sh->codec;
+        pkt->start = p->nav_segment_start;
+        pkt->end = MP_NOPTS_VALUE;
+    }
 
     MP_TRACE(demuxer, "opts: %d %f %f\n", sh->type, pkt->pts, pkt->dts);
-
-    if (sh->type == STREAM_VIDEO) {
-        // Remember the last authored keyframe so a menu hold can flush it out of
-        // the decoder (see the DVDNAV_WAIT injection above). Real video flowing
-        // also re-arms the flush for the next hold.
-        if (pkt->keyframe && pkt->pts != MP_NOPTS_VALUE) {
-            talloc_free(p->still_flush_pkt);
-            p->still_flush_pkt = demux_copy_packet(demuxer->packet_pool, pkt);
-        }
-        p->still_flush_count = 0;
-    }
 
     *out_pkt = pkt;
     return 1;
@@ -590,7 +555,6 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
 static void d_close(demuxer_t *demuxer)
 {
     struct priv *p = demuxer->priv;
-    talloc_free(p->still_flush_pkt);
     demux_free(p->slave);
 }
 

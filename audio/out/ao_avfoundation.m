@@ -938,9 +938,13 @@ static bool set_pause(struct ao *ao, bool paused)
     }
 
     if (paused) {
+        [p->renderer stopRequestingMediaData];
         [p->synchronizer setRate:0];
     } else {
         [p->synchronizer setRate:1];
+        [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+            feed(ao);
+        }];
     }
 
     return true;

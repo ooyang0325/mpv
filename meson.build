@@ -744,6 +744,9 @@ if features['libbluray']
     dependencies += libbluray
     sources += files('stream/stream_bluray.c')
 endif
+features += {'libbluray-gpr': features['libbluray'] and
+             cc.has_function('bd_get_gpr', dependencies: libbluray,
+                             prefix: '#include <libbluray/bluray.h>')}
 
 libm = cc.find_library('m', required: false)
 if libm.found()
