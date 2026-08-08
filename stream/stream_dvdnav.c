@@ -66,7 +66,6 @@ struct priv {
     dvdnav_t *dvdnav;                   // handle to libdvdnav stuff
     char *filename;                     // path
     unsigned int duration;              // in milliseconds
-    int mousex, mousey;
     int title;
     uint32_t spu_clut[16];
     bool spu_clut_valid;
@@ -105,7 +104,6 @@ struct priv {
     bool overlay_visible;
     bool menu_active;
     bool mouse_over_button;
-    uint32_t uo_mask;
     int still_length;        // 0: none, -1: infinite, >0: seconds
     bool reset_pending;      // nested demuxer should re-sync
     bool wait_pending;       // parked at a DVDNAV_WAIT sync point
@@ -482,17 +480,11 @@ static void dvd_publish_overlay(stream_t *s)
 
     struct sub_bitmaps *imgs = NULL;
     bool over_button = false;
-    uint32_t uo = 0;
     if (menu_domain && btn_ns > 0) {
         imgs = dvd_build_overlay(s, pci);
         int32_t button = 0;
         dvdnav_get_current_highlight(nav, &button);
         over_button = button > 0;
-        // Surface the authored UOP restrictions the player may care about.
-        user_ops_t ops = pci->pci_gi.vobu_uop_ctl;
-        if (ops.button_select_or_activate) uo |= MP_NAV_UO_BUTTON;
-        if (ops.title_menu_call || ops.root_menu_call) uo |= MP_NAV_UO_MENU;
-        if (ops.resume) uo |= MP_NAV_UO_RESUME;
     }
 
     uint32_t w = p->video_w > 0 ? p->video_w : 720;
@@ -507,7 +499,6 @@ static void dvd_publish_overlay(stream_t *s)
     p->overlay_visible = imgs != NULL;
     p->menu_active = mp_dvd_menu_active(menu_domain, btn_ns);
     p->mouse_over_button = over_button;
-    p->uo_mask = uo;
     p->overlay_w = w;
     p->overlay_h = h;
     mp_mutex_unlock(&p->nav_lock);
@@ -575,8 +566,6 @@ static void dvd_apply_nav_command(stream_t *s, struct mp_nav_cmd *cmd)
         p->overlay_dirty = true;
         break;
     case MP_NAV_ACTION_MOUSE_MOVE: {
-        p->mousex = cmd->x;
-        p->mousey = cmd->y;
         dvdnav_status_t st = dvdnav_mouse_select(nav, pci, cmd->x, cmd->y);
         mp_mutex_lock(&p->nav_lock);
         p->mouse_over_button = st == DVDNAV_STATUS_OK;
@@ -585,8 +574,6 @@ static void dvd_apply_nav_command(stream_t *s, struct mp_nav_cmd *cmd)
         break;
     }
     case MP_NAV_ACTION_MOUSE_CLICK:
-        p->mousex = cmd->x;
-        p->mousey = cmd->y;
         dvdnav_status_t click = uo.button_select_or_activate
                               ? DVDNAV_STATUS_ERR
                               : dvdnav_mouse_activate(nav, pci, cmd->x, cmd->y);
@@ -1149,9 +1136,6 @@ static int control(stream_t *stream, int cmd, void *arg)
             .overlay_visible = priv->overlay_visible,
             .wait_pending = priv->wait_pending,
             .still_seconds = priv->still_length,
-            .uo_mask = priv->uo_mask,
-            .overlay_w = priv->overlay_w,
-            .overlay_h = priv->overlay_h,
             .overlay_change_id = priv->overlay_change_id,
         };
         mp_mutex_unlock(&priv->nav_lock);

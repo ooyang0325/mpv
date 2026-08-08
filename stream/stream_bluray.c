@@ -69,7 +69,6 @@
 #define BLURAY_MAX_PENDING_SFX 8
 
 // libbluray always authors sound effects as 48 kHz LPCM (see bd_sound_effect).
-#define BLURAY_SOUND_EFFECT_RATE 48000
 
 #define BLURAY_DEFAULT_ANGLE      0
 #define BLURAY_DEFAULT_CHAPTER    0
@@ -152,7 +151,6 @@ struct bluray_priv_s {
     bool in_menu;
     bool popup_available;
     bool mouse_over_button;
-    uint32_t uo_mask;
     int still_length;            // 0: none, -1: infinite, >0: seconds
     bool reset_pending;          // nested demuxer should re-sync
     int reset_id;
@@ -160,7 +158,6 @@ struct bluray_priv_s {
     bool wait_pending;           // natural EOT is draining through the player
     bool wait_release;
     bool transition_overlay_pending;
-    int mousex, mousey;
     uint8_t *held_data;          // event-associated bytes replayed after reset
     int held_len, held_pos;
 
@@ -420,8 +417,6 @@ static void apply_nav_command(struct bluray_priv_s *b, struct mp_nav_cmd *cmd)
         bd_user_input(b->bd, pts, BD_VK_POPUP);
         break;
     case MP_NAV_ACTION_MOUSE_MOVE: {
-        b->mousex = cmd->x;
-        b->mousey = cmd->y;
         int over = bd_mouse_select(b->bd, pts, cmd->x, cmd->y);
         mp_mutex_lock(&b->nav_lock);
         b->mouse_over_button = over > 0;
@@ -429,8 +424,6 @@ static void apply_nav_command(struct bluray_priv_s *b, struct mp_nav_cmd *cmd)
         break;
     }
     case MP_NAV_ACTION_MOUSE_CLICK: {
-        b->mousex = cmd->x;
-        b->mousey = cmd->y;
         int over = bd_mouse_select(b->bd, pts, cmd->x, cmd->y);
         mp_mutex_lock(&b->nav_lock);
         b->mouse_over_button = over > 0;
@@ -661,15 +654,6 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
                 b->reset_id++;
             b->reset_pending = true;
             b->reset_hold = true;
-            mp_mutex_unlock(&b->nav_lock);
-        }
-        break;
-#endif
-#if BLURAY_VERSION >= BLURAY_VERSION_CODE(1, 0, 1)
-    case BD_EVENT_UO_MASK_CHANGED:
-        if (b->use_nav) {
-            mp_mutex_lock(&b->nav_lock);
-            b->uo_mask = ev->param;
             mp_mutex_unlock(&b->nav_lock);
         }
         break;
@@ -975,9 +959,6 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
             .wait_pending = b->wait_pending,
             .reset_id = b->reset_id,
             .still_seconds = b->still_length,
-            .uo_mask = b->uo_mask,
-            .overlay_w = b->overlay_w,
-            .overlay_h = b->overlay_h,
             .overlay_change_id = b->overlay_change_id,
         };
         mp_mutex_unlock(&b->nav_lock);
@@ -1054,7 +1035,6 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
             .samples = e->samples, // transfer ownership to the caller
             .num_frames = e->num_frames,
             .num_channels = e->num_channels,
-            .rate = BLURAY_SOUND_EFFECT_RATE,
         };
         e->samples = NULL;
         b->sfx_head = (b->sfx_head + 1) % BLURAY_MAX_PENDING_SFX;

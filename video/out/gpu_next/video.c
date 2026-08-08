@@ -19,7 +19,7 @@
 #include "video/csputils.h"                // for mp_csp_params, mp_csp_equa...
 #include "video/img_format.h"              // for mp_imgfmt
 #include "video/mp_image.h"                // for mp_image, mp_image_params
-#include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
+#include "video/out/gpu_next/ra.h"
 #include "video/out/gpu/video.h"          // for gl_video_conf, gl_video_opts
 #include "video/out/gpu/hwdec.h"
 #include "video/out/placebo/ra_pl.h"
@@ -73,7 +73,7 @@ struct hwdec_fence {
 struct pl_video {
     struct mp_log *log;
     struct ra_next *ra;    // The libplacebo rendering abstraction
-    ra_queue queue;        // The frame queue for handling video frames and interpolation.
+    pl_queue queue;        // The frame queue for handling video frames and interpolation.
     uint64_t last_frame_id;// To avoid pushing duplicate frames into the queue.
     double last_pts;       // Last presentation timestamp we rendered at, for redraws.
     bool warned_no_nlq;    // Only complain once per session about a droppable EL.
@@ -522,11 +522,11 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
     struct pl_video *p = talloc_zero(NULL, struct pl_video);
     p->log = log;
     p->ra = ra;
-    p->queue = ra_next_queue_create(ra);
+    p->queue = pl_queue_create(ra->gpu);
 
     // Pre-find the texture formats we'll need for OSD bitmaps for efficiency.
-    p->osd_fmt[SUBBITMAP_LIBASS] = ra_next_find_fmt(p->ra, PL_FMT_UNORM, 1, 8, 8, 0);
-    p->osd_fmt[SUBBITMAP_BGRA]   = ra_next_find_fmt(p->ra, PL_FMT_UNORM, 4, 8, 8, 0);
+    p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_fmt(p->ra->gpu, PL_FMT_UNORM, 1, 8, 8, 0);
+    p->osd_fmt[SUBBITMAP_BGRA]   = pl_find_fmt(p->ra->gpu, PL_FMT_UNORM, 4, 8, 8, 0);
 
     // Create the state object that tracks brightness, contrast, etc.
     p->video_eq = mp_csp_equalizer_create(p, global);
@@ -543,7 +543,7 @@ void pl_video_uninit(struct pl_video **p_ptr) {
     struct pl_video *p = *p_ptr;
     if (!p) return;
 
-    ra_next_queue_destroy(&p->queue);
+    pl_queue_destroy(&p->queue);
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     if (p->num_hwdec_fences) {
         pl_gpu_finish(p->ra->gpu);
@@ -560,11 +560,11 @@ void pl_video_uninit(struct pl_video **p_ptr) {
     // Clean up all allocated OSD GPU resources
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state_storage.entries); i++) {
         struct pl_video_osd_entry *entry = &p->osd_state_storage.entries[i];
-        ra_next_tex_destroy(p->ra, &entry->tex);
+        pl_tex_destroy(p->ra->gpu, &entry->tex);
         talloc_free(entry->parts);
     }
     for (int i = 0; i < p->num_sub_tex; i++) {
-        ra_next_tex_destroy(p->ra, &p->sub_tex[i]);
+        pl_tex_destroy(p->ra->gpu, &p->sub_tex[i]);
     }
     talloc_free(p->sub_tex);
 
@@ -612,7 +612,7 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
             MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
 
         // Recreate the texture if its size needs to change.
-        bool ok = ra_next_tex_recreate(p->ra, &entry->tex, &(struct pl_tex_params) {
+        bool ok = pl_tex_recreate(p->ra->gpu, &entry->tex, &(struct pl_tex_params) {
             .format = tex_fmt,
             .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
             .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
@@ -625,7 +625,7 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
         }
 
         // Upload the new bitmap data to the GPU texture.
-        ok = ra_next_tex_upload(p->ra, &(struct pl_tex_transfer_params) {
+        ok = pl_tex_upload(p->ra->gpu, &(struct pl_tex_transfer_params) {
             .tex        = entry->tex,
             .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
             .row_pitch  = item->packed->stride[0],
@@ -745,7 +745,7 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
         mpi->priv = fp;
 
         // Push the frame into the queue with its callbacks.
-        ra_next_queue_push(p->queue, &(struct pl_source_frame) {
+        pl_queue_push(p->queue, &(struct pl_source_frame) {
             .pts = mpi->pts,
             .frame_data = mpi,
             .map = map_frame,
@@ -764,7 +764,7 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     struct pl_frame_mix queue_mix = {0};
     struct pl_queue_params qparams = *pl_queue_params(.pts = target_pts);
 
-    ra_next_queue_update(p->queue, &queue_mix, &qparams);
+    pl_queue_update(p->queue, &queue_mix, &qparams);
 
     // To render OSD, we need a representative source frame to get color space info.
     // The first frame in the mix is a perfect candidate.
@@ -907,7 +907,7 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
     }
 
     // Find an 8-bit RGBA renderable + host-readable format.
-    pl_fmt fbo_fmt = ra_next_find_fmt(p->ra, PL_FMT_UNORM, 4, 8, 8,
+    pl_fmt fbo_fmt = pl_find_fmt(p->ra->gpu, PL_FMT_UNORM, 4, 8, 8,
                                  PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
     if (!fbo_fmt) {
         mp_msg(p->log, MSGL_ERR, "pl_video_screenshot: failed to find screenshot format\n");
@@ -917,7 +917,7 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
     // Create a temporary renderable, host-readable texture sized to the source.
     int w = frame->current->w;
     int h = frame->current->h;
-    fbo = ra_next_tex_create(p->ra, pl_tex_params(
+    fbo = pl_tex_create(p->ra->gpu, pl_tex_params(
         .w = w,
         .h = h,
         .format = fbo_fmt,
@@ -968,7 +968,7 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
         goto done;
     }
 
-    bool ok = ra_next_tex_download(p->ra, &(struct pl_tex_transfer_params){
+    bool ok = pl_tex_download(p->ra->gpu, &(struct pl_tex_transfer_params){
         .tex = fbo,
         .ptr = res->planes[0],
         .row_pitch = res->stride[0],
@@ -983,7 +983,7 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
 
 done:
     if (fbo)
-        ra_next_tex_destroy(p->ra, &fbo);
+        pl_tex_destroy(p->ra->gpu, &fbo);
 
     ra_cleanup_pl_frame(p->ra, &source_frame);
 
@@ -1029,7 +1029,7 @@ void pl_video_update_osd(struct pl_video *p, struct osd_state *osd) {
 void pl_video_reset(struct pl_video *p) {
     if (!p || !p->ra) return;
     ra_pl_reset(p->ra);
-    ra_next_queue_reset(p->queue); // Also reset the frame queue.
+    pl_queue_reset(p->queue); // Also reset the frame queue.
     p->last_frame_id = 0;
     p->last_pts = 0;
 }

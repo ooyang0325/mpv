@@ -107,28 +107,6 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
     return CMTimeMake(time, 1000000000);
 }
 
-static int eac3_profile(const uint8_t *data, size_t size)
-{
-    int profile = AV_PROFILE_UNKNOWN;
-    const AVCodec *decoder = avcodec_find_decoder(AV_CODEC_ID_EAC3);
-    AVCodecContext *codec = avcodec_alloc_context3(decoder);
-    AVPacket *packet = av_packet_alloc();
-    AVFrame *frame = av_frame_alloc();
-    if (codec && packet && frame && av_new_packet(packet, size) >= 0) {
-        memcpy(packet->data, data, size);
-        // The public parser does not expose the JOC flag. Decode only this
-        // first frame to inspect its profile; playback remains compressed.
-        if (avcodec_open2(codec, decoder, NULL) >= 0 &&
-            avcodec_send_packet(codec, packet) >= 0 &&
-            avcodec_receive_frame(codec, frame) >= 0)
-            profile = codec->profile;
-    }
-    av_frame_free(&frame);
-    av_packet_free(&packet);
-    avcodec_free_context(&codec);
-    return profile;
-}
-
 static bool http_send_all(int fd, const void *data, size_t size)
 {
     const uint8_t *pos = data;
@@ -427,7 +405,7 @@ static bool compressed_close_muxer(struct ao *ao, bool report_error)
 }
 
 static bool compressed_open_muxer(struct ao *ao, const struct eac3_frame *fr,
-                                  const uint8_t *data, size_t size)
+                                  size_t size)
 {
     struct priv *p = ao->priv;
     if (p->hls)
@@ -486,9 +464,8 @@ static bool compressed_open_muxer(struct ao *ao, const struct eac3_frame *fr,
     }
     p->hls_header = true;
     p->compressed_rate = fr->rate;
-    bool atmos = eac3_profile(data, size) == AV_PROFILE_EAC3_DDP_ATMOS;
-    MP_VERBOSE(ao, "compressed route: E-AC-3%s %d Hz, %d channels via HLS/AVPlayer\n",
-               atmos ? "+JOC Atmos" : "", fr->rate, fr->channels);
+    MP_VERBOSE(ao, "compressed route: E-AC-3 %d Hz, %d channels via HLS/AVPlayer\n",
+               fr->rate, fr->channels);
     talloc_free(playlist);
     talloc_free(segments);
     talloc_free(init);
@@ -506,7 +483,7 @@ static bool compressed_write_packet(struct ao *ao, const struct eac3_frame *fr,
                                    const uint8_t *data, size_t size)
 {
     struct priv *p = ao->priv;
-    if (!compressed_open_muxer(ao, fr, data, size)) {
+    if (!compressed_open_muxer(ao, fr, size)) {
         if (p->hls && p->compressed_rate != fr->rate)
             MP_FATAL(ao, "E-AC-3 sample rate changed inside the stream\n");
         return false;

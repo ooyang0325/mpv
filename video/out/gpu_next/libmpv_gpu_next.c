@@ -195,8 +195,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     // Render the video frame.
     pl_video_render(p->video_engine, frame, target_tex, flip);
 
-    // Destroy the temporary wrapper texture via the RA.
-    ra_next_tex_destroy(p->context->ra, &target_tex);
+    pl_tex_destroy(p->context->ra->gpu, &target_tex);
 
     if (p->context->fns->done_frame)
         p->context->fns->done_frame(p->context);
@@ -284,8 +283,7 @@ static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
     if (!tex) return MPV_ERROR_GENERIC;
     *out_w = tex->params.w;
     *out_h = tex->params.h;
-    // Destroy the temporary wrapper texture via the RA.
-    ra_next_tex_destroy(p->context->ra, &tex);
+    pl_tex_destroy(p->context->ra->gpu, &tex);
     return 0;
 }
 

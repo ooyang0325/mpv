@@ -9,11 +9,9 @@
 #include "libplacebo/colorspace.h"         // for pl_bit_encoding, pl_bit_en...
 #include "libplacebo/gpu.h"                // for pl_tex, pl_fmt_type, pl_fi...
 #include "libplacebo/log.h"                // for pl_log
-#include "libplacebo/utils/frame_queue.h"  // for pl_queue_create, pl_queue_...
 #include "ta/ta_talloc.h"                  // for talloc_free, talloc_zero
 #include "video/img_format.h"              // for mp_imgfmt_comp_desc, mp_im...
 #include "video/mp_image.h"                // for mp_image, mp_image_params
-#include "video/out/vo.h"                  // for vo
 
 /**
  * @brief Private state for the libplacebo rendering abstraction.
@@ -25,75 +23,9 @@
 struct ra_priv {
     struct ra_next pub;     // Public interface, must be the first member.
     pl_renderer renderer;   // The core libplacebo renderer instance.
-    struct vo *vo;          // Back-pointer to the video output instance for context.
-
-    // OSD state
-    pl_tex *sub_tex;        // Texture pool for subtitles and OSD bitmaps.
-    int num_sub_tex;        // Current number of textures in the pool.
-    pl_tex overlay_tex;     // A texture for overlays.
-    pl_log pl_log;          // The libplacebo logging context.
-
 };
 
 /* --- New Abstraction Implementations --- */
-
-ra_queue ra_next_queue_create(struct ra_next *ra)
-{
-    return pl_queue_create(ra->gpu);
-}
-
-void ra_next_queue_destroy(ra_queue *queue)
-{
-    pl_queue_destroy(queue);
-}
-
-void ra_next_queue_push(ra_queue queue, const struct pl_source_frame *frame)
-{
-    pl_queue_push(queue, frame);
-}
-
-void ra_next_queue_update(ra_queue queue, struct pl_frame_mix *mix, const struct pl_queue_params *params)
-{
-    pl_queue_update(queue, mix, params);
-}
-
-void ra_next_queue_reset(ra_queue queue)
-{
-    pl_queue_reset(queue);
-}
-
-pl_tex ra_next_tex_create(struct ra_next *ra, const struct pl_tex_params *params)
-{
-    return pl_tex_create(ra->gpu, params);
-}
-
-void ra_next_tex_destroy(struct ra_next *ra, pl_tex *tex)
-{
-    pl_tex_destroy(ra->gpu, tex);
-}
-
-bool ra_next_tex_recreate(struct ra_next *ra, pl_tex *tex, const struct pl_tex_params *params)
-{
-    return pl_tex_recreate(ra->gpu, tex, params);
-}
-
-bool ra_next_tex_upload(struct ra_next *ra, const struct pl_tex_transfer_params *params)
-{
-    return pl_tex_upload(ra->gpu, params);
-}
-
-bool ra_next_tex_download(struct ra_next *ra, const struct pl_tex_transfer_params *params)
-{
-    return pl_tex_download(ra->gpu, params);
-}
-
-bool ra_next_render_image_mix(struct ra_next *ra, const struct pl_frame_mix *mix,
-                         struct pl_frame *target, const struct pl_render_params *params)
-{
-    struct ra_priv *p = (struct ra_priv *)ra;
-    if (!p->renderer) return false;
-    return pl_render_image_mix(p->renderer, mix, target, params);
-}
 
 bool ra_next_render_image(struct ra_next *ra, const struct pl_frame *src,
                      struct pl_frame *target, const struct pl_render_params *params)
@@ -103,27 +35,6 @@ bool ra_next_render_image(struct ra_next *ra, const struct pl_frame *src,
     return pl_render_image(p->renderer, src, target, params);
 }
 
-pl_fmt ra_next_find_fmt(struct ra_next *ra, enum pl_fmt_type type, int num_comps,
-                   int comp_bits, int alpha_bits, unsigned caps)
-{
-    return pl_find_fmt(ra->gpu, type, num_comps, comp_bits, alpha_bits, caps);
-}
-
-
-/**
- * @brief Public wrapper to upload an mpv image to a libplacebo frame.
- * @param ra The rendering abstraction context.
- * @param out_frame The destination pl_frame to be populated.
- * @param img The source mp_image containing pixel data.
- * @return True on success, false on failure.
- */
-bool ra_upload_mp_image(struct ra_next *ra, struct pl_frame *out_frame,
-                        const struct mp_image *img)
-{
-    if (!img || !out_frame) return false;
-    return upload_mp_image_to_pl_frame(ra, out_frame, img); // reuse existing impl
-}
-
 /**
  * @brief Public wrapper to clean up GPU resources associated with a pl_frame.
  * @param ra The rendering abstraction context.
@@ -131,67 +42,11 @@ bool ra_upload_mp_image(struct ra_next *ra, struct pl_frame *out_frame,
  */
 void ra_cleanup_pl_frame(struct ra_next *ra, struct pl_frame *frame)
 {
-    ra_pl_cleanup_frame(ra, frame); // reuse existing impl
-}
-
-/**
- * @brief Gets the underlying libplacebo renderer instance.
- * @param ra The rendering abstraction context.
- * @return A pointer to the pl_renderer, or NULL if not initialized.
- */
-pl_renderer ra_get_renderer(struct ra_next *ra)
-{
-    struct ra_priv *p = (struct ra_priv *)ra;
-    return p ? p->renderer : NULL;
-}
-
-/**
- * @brief Gets the underlying libplacebo GPU handle.
- * @param ra The rendering abstraction context.
- * @return The pl_gpu handle.
- */
-pl_gpu ra_get_gpu(struct ra_next *ra)
-{
-    return ra ? ra->gpu : NULL;
-}
-
-/**
- * @brief Gets the libplacebo logging context.
- * @param ra The rendering abstraction context.
- * @return The pl_log handle.
- */
-pl_log ra_get_pl_log(struct ra_next *ra)
-{
-    if (!ra)
-        return NULL;
-    struct ra_priv *p = (struct ra_priv *)ra;
-    return p->pl_log;
-}
-
-/**
- * @brief Associates a video output (vo) context with the rendering abstraction.
- * @param ra The rendering abstraction context.
- * @param vo The video output context to associate.
- */
-void ra_pl_set_vo(struct ra_next *ra, struct vo *vo)
-{
-    struct ra_priv *p = (struct ra_priv *)ra;
-    p->vo = vo;
-    mp_msg(ra->log, MSGL_DEBUG, "ra_pl_set_vo: vo=%p osd=%p\n", (void*)vo, vo ? (void*)vo->osd : NULL);
-}
-
-/**
- * @brief Frees all GPU textures associated with a given `pl_frame`.
- * @param ra The rendering abstraction context.
- * @param frame The frame to clean up.
- */
-void ra_pl_cleanup_frame(struct ra_next *ra, struct pl_frame *frame)
-{
     if (!frame)
         return;
     // Iterate over each plane and destroy its associated texture.
     for (int i = 0; i < frame->num_planes; i++)
-        ra_next_tex_destroy(ra, &frame->planes[i].texture);
+        pl_tex_destroy(ra->gpu, &frame->planes[i].texture);
 }
 
 /**
@@ -293,9 +148,12 @@ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
  * @param img The input `mp_image`.
  * @return True on success, false on failure.
  */
-bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame,
-                                        const struct mp_image *img)
+bool ra_upload_mp_image(struct ra_next *ra, struct pl_frame *out_frame,
+                        const struct mp_image *img)
 {
+    if (!img || !out_frame)
+        return false;
+
     // Initialize the frame with color space and crop metadata. Assign the fields this
     // function owns rather than replacing the struct: a compound literal here silently
     // cleared everything the caller had already set, and rotation -- which the VO
@@ -339,7 +197,7 @@ bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame,
 
 error:
     // Clean up any successfully created textures if one fails.
-    ra_pl_cleanup_frame(ra, out_frame);
+    ra_cleanup_pl_frame(ra, out_frame);
     return false;
 }
 
@@ -399,8 +257,6 @@ struct ra_next *ra_pl_create(pl_gpu gpu, struct mp_log *log, pl_log log_pl)
     // Initialize public members.
     ra->gpu = gpu;
     ra->log = mp_log_new(p, log, "ra-pl"); // Create a sub-logger for this module.
-    p->pl_log = log_pl;
-
     // Create renderer (needed by the higher-level pl_render_image calls)
     p->renderer = pl_renderer_create(log_pl, gpu);
     if (!p->renderer) {

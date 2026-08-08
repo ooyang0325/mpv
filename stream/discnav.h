@@ -37,8 +37,6 @@ struct mp_nav_state_info {
     bool wait_pending;       // stream parked at a DVDNAV_WAIT sync point
     int reset_id;            // incremented for each hard media boundary
     int still_seconds;       // 0: none, -1: infinite still, >0: timed still
-    uint32_t uo_mask;        // BLURAY_UO_* mask of prohibited operations
-    int overlay_w, overlay_h; // authored overlay plane resolution (for scaling)
     int overlay_change_id;   // bumped whenever the overlay bitmaps change
 };
 
@@ -134,13 +132,6 @@ struct mp_nav_cmd {
     int64_t pts; // last presented title-relative 90 kHz video PTS, or -1
 };
 
-// Generic prohibited-operation flags exposed in mp_nav_state_info.uo_mask.
-// Producers translate the library's native UOP mask into this small subset the
-// player may care about; unset means "operation currently allowed".
-#define MP_NAV_UO_BUTTON  (1u << 0) // button select/activate prohibited
-#define MP_NAV_UO_MENU    (1u << 1) // menu call prohibited
-#define MP_NAV_UO_RESUME  (1u << 2) // resume/leave-menu prohibited
-
 // One authored menu sound effect handed from the disc stream to the player.
 // libbluray delivers these as short 48 kHz, 16-bit LPCM clips (mono or stereo,
 // interleaved) via BD_EVENT_SOUND_EFFECT; the producer copies the PCM out of
@@ -150,7 +141,6 @@ struct mp_nav_sound_effect {
     int16_t *samples;    // owned by caller after fetch; talloc-freed by it
     int num_frames;      // frames (not samples) in `samples`
     int num_channels;    // 1 (mono) or 2 (stereo)
-    int rate;            // sample rate in Hz (always 48000 for Blu-ray)
 };
 
 // Overlay fetch result: bitmaps, their generation id and authored resolution,

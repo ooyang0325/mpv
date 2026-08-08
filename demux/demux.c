@@ -2943,15 +2943,6 @@ int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
     return r;
 }
 
-// Whether the demuxer runs its own reader thread (--demuxer-thread). When false
-// the player drives reads synchronously (demux_read_packet_async_until()), so a
-// reader that returns "no packet, not EOF" would spin forever; callers need an
-// explicit non-threaded path instead.
-bool demux_is_threaded(struct demuxer *demuxer)
-{
-    return demuxer->in->threading;
-}
-
 // Read and return any packet we find. NULL means EOF.
 // Does not work with threading (don't call demux_start_thread()).
 struct demux_packet *demux_read_any_packet(struct demuxer *demuxer)
