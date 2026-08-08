@@ -56,12 +56,23 @@ struct mp_nav_state {
     int applied_reset_id;
     struct sub_bitmaps *authored; // owned, in authored coords, for re-scaling
     int overlay_w, overlay_h;     // authored size paired with `authored`
+    struct sub_bitmaps *pending_authored;
+    int pending_overlay_w, pending_overlay_h;
+    int64_t pending_overlay_pts;
+    bool pending_overlay_valid;
+    bool pending_menu_active;
+    bool pending_overlay_visible;
+    bool pending_mouse_over_button;
     bool overlay_wait_for_video;
     bool overlay_restart_seen;
     struct mp_osd_res last_res;
     bool audio_idled;             // AO is paused during a silent hold
     int audio_quiet_polls;        // consecutive polls the hold has been silent
     bool eof_hold;                // transient menu EOF has not resumed media yet
+    int applied_audio_change_id;
+    int pending_audio_change_id;
+    int pending_audio_pid;
+    bool authored_audio_disabled;
 };
 
 // Return the disc stream if the current demuxer is a disc menu stream
@@ -131,6 +142,44 @@ static void fetch_sound_effects(struct MPContext *mpctx, struct stream *s)
     }
 }
 
+static void apply_authored_audio(struct MPContext *mpctx,
+                                 struct mp_nav_state_info *info)
+{
+    struct mp_nav_state *nav = mpctx->nav_state;
+    if (info->authored_audio_change_id != nav->pending_audio_change_id &&
+        info->authored_audio_change_id != nav->applied_audio_change_id)
+    {
+        nav->pending_audio_change_id = info->authored_audio_change_id;
+        nav->pending_audio_pid = info->authored_audio_pid;
+    }
+
+    if (nav->pending_audio_change_id == nav->applied_audio_change_id)
+        return;
+    if (nav->authored_audio_disabled || nav->pending_audio_pid < 0)
+    {
+        nav->applied_audio_change_id = nav->pending_audio_change_id;
+        return;
+    }
+
+    struct track *target = NULL;
+    for (int n = 0; n < mpctx->num_tracks; n++) {
+        struct track *track = mpctx->tracks[n];
+        if (track->type == STREAM_AUDIO && !track->is_external &&
+            track->demuxer == mpctx->demuxer && track->stream &&
+            track->demuxer_id == nav->pending_audio_pid)
+        {
+            target = track;
+            break;
+        }
+    }
+    if (!target)
+        return;
+
+    if (mpctx->current_track[0][STREAM_AUDIO] != target)
+        mp_switch_track(mpctx, STREAM_AUDIO, target, 0);
+    nav->applied_audio_change_id = nav->pending_audio_change_id;
+}
+
 void mp_handle_nav(struct MPContext *mpctx)
 {
     struct stream *s = get_nav_stream(mpctx);
@@ -146,35 +195,93 @@ void mp_handle_nav(struct MPContext *mpctx)
         mpctx->nav_state = talloc_zero(mpctx, struct mp_nav_state);
         mpctx->nav_state->log = mp_log_new(mpctx->nav_state, mpctx->log, "discnav");
         mpctx->nav_state->applied_overlay_change_id = -1;
+        mpctx->nav_state->applied_audio_change_id = -1;
+        mpctx->nav_state->pending_audio_change_id = -1;
         MP_VERBOSE(mpctx->nav_state, "enabling disc menu navigation\n");
     }
     struct mp_nav_state *nav = mpctx->nav_state;
 
     if (info.reset_id != nav->applied_reset_id) {
         nav->applied_reset_id = info.reset_id;
+        talloc_free(nav->pending_authored);
+        nav->pending_authored = NULL;
+        nav->pending_overlay_valid = false;
+        talloc_free(nav->authored);
+        nav->authored = NULL;
+        nav->overlay_wait_for_video = false;
+        nav->st.menu_active = false;
+        nav->st.overlay_visible = false;
+        nav->st.mouse_over_button = false;
+        osd_set_nav(mpctx->osd, NULL);
         demux_flush(mpctx->demuxer);
         reset_playback_state(mpctx);
         demux_start_prefetch(mpctx->demuxer);
     }
 
+    apply_authored_audio(mpctx, &info);
+
     struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
-    if (info.overlay_change_id != nav->applied_overlay_change_id) {
+    int64_t video_pts = mpctx->video_pts == MP_NOPTS_VALUE
+        ? -1 : llrint(mpctx->video_pts * 90000);
+    if (!nav->pending_overlay_valid &&
+        info.overlay_change_id != nav->applied_overlay_change_id)
+    {
         // Fetch bitmaps, their generation id and authored size together, and
         // trust the fetched id: a publish between the state poll and this fetch
         // cannot leave us applying a mismatched generation.
         struct mp_nav_overlay ov = {0};
         stream_control(s, STREAM_CTRL_GET_NAV_OVERLAY, &ov);
-        talloc_free(nav->authored);
-        nav->authored = talloc_steal(nav, ov.imgs); // may be NULL
-        nav->overlay_w = ov.w;
-        nav->overlay_h = ov.h;
         nav->applied_overlay_change_id = ov.change_id;
-        nav->overlay_wait_for_video = ov.wait_for_video;
-        nav->overlay_restart_seen = !mpctx->restart_complete;
-        if (!nav->overlay_wait_for_video) {
-            apply_overlay(mpctx);
-            nav->last_res = res;
+        if (!mp_nav_overlay_due(video_pts, ov.present_pts)) {
+            talloc_free(nav->pending_authored);
+            nav->pending_authored = talloc_steal(nav, ov.imgs);
+            nav->pending_overlay_w = ov.w;
+            nav->pending_overlay_h = ov.h;
+            nav->pending_overlay_pts = ov.present_pts;
+            nav->pending_overlay_valid = true;
+            nav->pending_menu_active = ov.menu_active;
+            nav->pending_overlay_visible = ov.overlay_visible;
+            nav->pending_mouse_over_button = ov.mouse_over_button;
+        } else {
+            talloc_free(nav->pending_authored);
+            nav->pending_authored = NULL;
+            nav->pending_overlay_valid = false;
+            talloc_free(nav->authored);
+            nav->authored = talloc_steal(nav, ov.imgs); // may be NULL
+            nav->overlay_w = ov.w;
+            nav->overlay_h = ov.h;
+            nav->overlay_wait_for_video = ov.wait_for_video;
+            nav->overlay_restart_seen = !mpctx->restart_complete;
+            info.menu_active = ov.menu_active;
+            info.overlay_visible = ov.overlay_visible;
+            info.mouse_over_button = ov.mouse_over_button;
+            if (!nav->overlay_wait_for_video) {
+                apply_overlay(mpctx);
+                nav->last_res = res;
+            }
         }
+    }
+
+    if (nav->pending_overlay_valid &&
+        mp_nav_overlay_due(video_pts, nav->pending_overlay_pts))
+    {
+        talloc_free(nav->authored);
+        nav->authored = nav->pending_authored;
+        nav->pending_authored = NULL;
+        nav->pending_overlay_valid = false;
+        nav->overlay_w = nav->pending_overlay_w;
+        nav->overlay_h = nav->pending_overlay_h;
+        nav->overlay_wait_for_video = false;
+        info.menu_active = nav->pending_menu_active;
+        info.overlay_visible = nav->pending_overlay_visible;
+        info.mouse_over_button = nav->pending_mouse_over_button;
+        apply_overlay(mpctx);
+        nav->last_res = res;
+    } else if (nav->pending_overlay_valid) {
+        info.menu_active = nav->st.menu_active;
+        info.overlay_visible = nav->st.overlay_visible;
+        info.mouse_over_button = nav->st.mouse_over_button;
+        mp_set_timeout(mpctx, 0.01);
     }
 
     if (nav->overlay_wait_for_video) {
@@ -307,12 +414,19 @@ static void window_to_authored(struct MPContext *mpctx, int wx, int wy,
 void mp_nav_user_input(struct MPContext *mpctx, const char *action)
 {
     struct stream *s = get_nav_stream(mpctx);
-    if (!s)
+    struct mp_nav_state *nav = mpctx->nav_state;
+    if (!s || (nav && (nav->pending_overlay_valid ||
+                       nav->st.overlay_change_id !=
+                       nav->applied_overlay_change_id)))
         return;
     struct mp_nav_cmd cmd = {
         .action = parse_action(action),
         .pts = mpctx->video_pts == MP_NOPTS_VALUE
             ? -1 : llrint(mpctx->video_pts * 90000),
+        .overlay_change_id = mpctx->nav_state
+            ? mpctx->nav_state->applied_overlay_change_id : -1,
+        .reset_id = mpctx->nav_state
+            ? mpctx->nav_state->applied_reset_id : -1,
     };
     if (cmd.action == MP_NAV_ACTION_NONE)
         return;
@@ -326,6 +440,12 @@ void mp_nav_user_input(struct MPContext *mpctx, const char *action)
     if (stream_control(s, STREAM_CTRL_NAV_CMD, &cmd) == STREAM_OK)
         demux_resume(mpctx->demuxer);
     mp_wakeup_core(mpctx);
+}
+
+void mp_nav_disable_authored_audio(struct MPContext *mpctx)
+{
+    if (mpctx->nav_state)
+        mpctx->nav_state->authored_audio_disabled = true;
 }
 
 bool mp_nav_menu_active(struct MPContext *mpctx)

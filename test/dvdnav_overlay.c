@@ -270,6 +270,28 @@ static void test_demux_drained(void)
     assert_true(mp_nav_demux_drained(true, 0));
 }
 
+static void test_overlay_timing(void)
+{
+    assert_int_equal(mp_nav_dvd_hli_pts(900000, 900000, 1080000), 1080000);
+    assert_false(mp_nav_overlay_due(1079999, 1080000));
+    assert_true(mp_nav_overlay_due(1080000, 1080000));
+    assert_true(mp_nav_overlay_due(-1, -1));
+    assert_false(mp_nav_overlay_due(-1, 1080000));
+
+    // hli_s_ptm wrapped past UINT32_MAX while the current VOBU is just before it.
+    assert_int_equal(mp_nav_dvd_hli_pts(900000, 0xfffffff0, 0x00000020),
+                     900048);
+}
+
+static void test_bluray_audio_stream_index(void)
+{
+    assert_int_equal(mp_nav_bluray_stream_index(1, 2), 0);
+    assert_int_equal(mp_nav_bluray_stream_index(2, 2), 1);
+    assert_int_equal(mp_nav_bluray_stream_index(0, 2), -1);
+    assert_int_equal(mp_nav_bluray_stream_index(0xff, 2), -1);
+    assert_int_equal(mp_nav_bluray_stream_index(3, 2), -1);
+}
+
 int main(void)
 {
     init_clut();
@@ -286,5 +308,7 @@ int main(void)
     test_nav_eof_hold();
     test_nav_audio_idle();
     test_demux_drained();
+    test_overlay_timing();
+    test_bluray_audio_stream_index();
     return 0;
 }

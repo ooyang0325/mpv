@@ -38,6 +38,8 @@ struct mp_nav_state_info {
     int reset_id;            // incremented for each hard media boundary
     int still_seconds;       // 0: none, -1: infinite still, >0: timed still
     int overlay_change_id;   // bumped whenever the overlay bitmaps change
+    int authored_audio_pid;  // MPEG-TS PID selected by the authored menu, or -1
+    int authored_audio_change_id;
 };
 
 // Whether the player pipeline has drained to a DVDNAV_WAIT boundary and the
@@ -110,6 +112,27 @@ static inline bool mp_nav_audio_idle(bool menu_active, int still_seconds,
     return hold && !has_program_audio;
 }
 
+// Map DVD's 32-bit PCI clock into the title-relative 90 kHz timeline reported
+// by libdvdnav. The signed delta preserves the intended value across PTM wrap.
+static inline int64_t mp_nav_dvd_hli_pts(int64_t current_pts,
+                                         uint32_t vobu_start,
+                                         uint32_t hli_start)
+{
+    return current_pts + (int32_t)(hli_start - vobu_start);
+}
+
+static inline bool mp_nav_overlay_due(int64_t video_pts, int64_t present_pts)
+{
+    return present_pts < 0 || (video_pts >= 0 && video_pts >= present_pts);
+}
+
+static inline int mp_nav_bluray_stream_index(uint32_t stream_number,
+                                              int stream_count)
+{
+    return stream_number > 0 && stream_number != 0xff &&
+           stream_number <= stream_count ? stream_number - 1 : -1;
+}
+
 // User input actions: player/client -> stream.
 // Delivered via STREAM_CTRL_NAV_CMD.
 enum mp_nav_action {
@@ -130,6 +153,8 @@ struct mp_nav_cmd {
     enum mp_nav_action action;
     int x, y; // authored (overlay-plane) coordinates for mouse actions
     int64_t pts; // last presented title-relative 90 kHz video PTS, or -1
+    int overlay_change_id; // generation visible when the command was issued
+    int reset_id; // navigation epoch visible when the command was issued
 };
 
 // One authored menu sound effect handed from the disc stream to the player.
@@ -150,7 +175,11 @@ struct mp_nav_overlay {
     struct sub_bitmaps *imgs; // owned by caller after fetch; NULL clears/none
     int change_id;            // generation of imgs (and of the current overlay)
     int w, h;                 // authored overlay-plane resolution for scaling
+    bool menu_active;
+    bool overlay_visible;
+    bool mouse_over_button;
     bool wait_for_video;      // show with the first frame after a playlist reset
+    int64_t present_pts;      // title-relative 90 kHz PTS; -1 means immediate
 };
 
 #endif // MP_STREAM_DISCNAV_H

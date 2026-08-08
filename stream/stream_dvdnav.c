@@ -98,14 +98,18 @@ struct priv {
 
     // Shared with the player thread; protected by nav_lock.
     mp_mutex nav_lock;
-    struct sub_bitmaps *pending_overlay; // owned; handed to the player on demand
+    struct mp_nav_overlay *overlay_queue;
+    int num_overlays;
     int overlay_change_id;
     int overlay_w, overlay_h;
     bool overlay_visible;
     bool menu_active;
+    bool menu_transport;
     bool mouse_over_button;
+    int64_t overlay_present_pts;
     int still_length;        // 0: none, -1: infinite, >0: seconds
     bool reset_pending;      // nested demuxer should re-sync
+    int reset_id;
     bool wait_pending;       // parked at a DVDNAV_WAIT sync point
     bool wait_release;       // player signalled its pipeline has drained
     struct mp_nav_cmd *cmd_queue;
@@ -466,6 +470,23 @@ static bool dvd_in_menu_domain(dvdnav_t *nav)
            dvdnav_is_domain_vtsm(nav) > 0;
 }
 
+static void dvd_begin_reset(struct priv *p)
+{
+    mp_mutex_lock(&p->nav_lock);
+    if (!p->reset_pending)
+        p->reset_id++;
+    p->reset_pending = true;
+    for (int n = 0; n < p->num_overlays; n++)
+        talloc_free(p->overlay_queue[n].imgs);
+    free(p->overlay_queue);
+    p->overlay_queue = NULL;
+    p->num_overlays = 0;
+    free(p->cmd_queue);
+    p->cmd_queue = NULL;
+    p->num_cmds = 0;
+    mp_mutex_unlock(&p->nav_lock);
+}
+
 // Rebuild the overlay/state snapshot and publish it to the player side. Bitmaps
 // are built outside the lock; the change id, bitmaps, visibility and authored
 // size are stored together under nav_lock so the consumer stays consistent.
@@ -476,7 +497,13 @@ static void dvd_publish_overlay(stream_t *s)
 
     bool menu_domain = dvd_in_menu_domain(nav);
     pci_t *pci = dvdnav_get_current_nav_pci(nav);
-    int btn_ns = (pci && menu_domain) ? (pci->hli.hl_gi.btn_ns & 0x3f) : 0;
+    bool hli_active = pci && menu_domain && (pci->hli.hl_gi.hli_ss & 3);
+    int btn_ns = hli_active ? (pci->hli.hl_gi.btn_ns & 0x3f) : 0;
+    int64_t present_pts = dvdnav_get_current_time(nav);
+    if (hli_active) {
+        present_pts = mp_nav_dvd_hli_pts(present_pts,
+            pci->pci_gi.vobu_s_ptm, pci->hli.hl_gi.hli_s_ptm);
+    }
 
     struct sub_bitmaps *imgs = NULL;
     bool over_button = false;
@@ -491,16 +518,54 @@ static void dvd_publish_overlay(stream_t *s)
     uint32_t h = p->video_h > 0 ? p->video_h : 480;
 
     mp_mutex_lock(&p->nav_lock);
+    bool redundant_clear = !imgs && !p->overlay_visible && !p->menu_active &&
+                           !p->mouse_over_button && btn_ns == 0;
+    p->menu_transport = menu_domain;
+    p->overlay_present_pts = present_pts;
+    p->overlay_w = w;
+    p->overlay_h = h;
+    if (redundant_clear) {
+        mp_mutex_unlock(&p->nav_lock);
+        return;
+    }
+
     int id = ++p->overlay_change_id;
     if (imgs)
         imgs->change_id = id;
-    talloc_free(p->pending_overlay);
-    p->pending_overlay = imgs;
     p->overlay_visible = imgs != NULL;
     p->menu_active = mp_dvd_menu_active(menu_domain, btn_ns);
     p->mouse_over_button = over_button;
-    p->overlay_w = w;
-    p->overlay_h = h;
+    struct mp_nav_overlay next = {
+        .imgs = imgs,
+        .change_id = id,
+        .w = w,
+        .h = h,
+        .menu_active = p->menu_active,
+        .overlay_visible = p->overlay_visible,
+        .mouse_over_button = p->mouse_over_button,
+        .present_pts = present_pts,
+    };
+    if (p->num_overlays > 0) {
+        struct mp_nav_overlay *last =
+            &p->overlay_queue[p->num_overlays - 1];
+        if (last->present_pts == present_pts) {
+            talloc_free(last->imgs);
+            *last = next;
+            mp_mutex_unlock(&p->nav_lock);
+            return;
+        }
+    }
+    struct mp_nav_overlay *queue =
+        realloc(p->overlay_queue,
+                (p->num_overlays + 1) * sizeof(*p->overlay_queue));
+    if (!queue) {
+        talloc_free(imgs);
+        mp_mutex_unlock(&p->nav_lock);
+        MP_ERR(s, "Unable to queue DVD menu overlay.\n");
+        return;
+    }
+    p->overlay_queue = queue;
+    p->overlay_queue[p->num_overlays++] = next;
     mp_mutex_unlock(&p->nav_lock);
 }
 
@@ -573,7 +638,7 @@ static void dvd_apply_nav_command(stream_t *s, struct mp_nav_cmd *cmd)
         p->overlay_dirty = true;
         break;
     }
-    case MP_NAV_ACTION_MOUSE_CLICK:
+    case MP_NAV_ACTION_MOUSE_CLICK: {
         dvdnav_status_t click = uo.button_select_or_activate
                               ? DVDNAV_STATUS_ERR
                               : dvdnav_mouse_activate(nav, pci, cmd->x, cmd->y);
@@ -584,6 +649,7 @@ static void dvd_apply_nav_command(stream_t *s, struct mp_nav_cmd *cmd)
         }
         p->overlay_dirty = true;
         break;
+    }
     case MP_NAV_ACTION_RESUME:
         // Leave the menu / resume playback where possible.
         if (!uo.resume &&
@@ -607,8 +673,11 @@ static void dvd_drain_nav_commands(stream_t *s)
     p->num_cmds = 0;
     mp_mutex_unlock(&p->nav_lock);
 
-    for (int i = 0; i < num; i++)
-        dvd_apply_nav_command(s, &queue[i]);
+    for (int i = 0; i < num; i++) {
+        if (queue[i].reset_id == p->reset_id &&
+            queue[i].overlay_change_id == p->overlay_change_id)
+            dvd_apply_nav_command(s, &queue[i]);
+    }
     free(queue);
 }
 
@@ -640,11 +709,11 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
     dvdnav_t *nav = p->dvdnav;
 
     for (;;) {
-        dvd_drain_nav_commands(s);
         if (p->overlay_dirty) {
             dvd_publish_overlay(s);
             p->overlay_dirty = false;
         }
+        dvd_drain_nav_commands(s);
 
         // DVDNAV_WAIT drain handshake. On a WAIT we return 0 (below), letting the
         // demux/decoder pipeline reach a resumable EOF. The player restarts
@@ -809,9 +878,7 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
                 p->had_initial_vts = true;
             } else {
                 // Any VTS boundary is an elementary-stream discontinuity.
-                mp_mutex_lock(&p->nav_lock);
-                p->reset_pending = true;
-                mp_mutex_unlock(&p->nav_lock);
+                dvd_begin_reset(p);
             }
             dvd_publish_overlay(s);
             p->overlay_dirty = false;
@@ -828,9 +895,7 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
                 p->cur_domain = new_domain;
                 dvd_reset_spu(p);
                 p->activated = false;
-                mp_mutex_lock(&p->nav_lock);
-                p->reset_pending = true;
-                mp_mutex_unlock(&p->nav_lock);
+                dvd_begin_reset(p);
             }
             p->overlay_dirty = true;
             break;
@@ -838,9 +903,7 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
         case DVDNAV_HOP_CHANNEL:
             dvd_reset_spu(p);
             p->spu_stream = -1; // resolved again on the next SPU_STREAM_CHANGE
-            mp_mutex_lock(&p->nav_lock);
-            p->reset_pending = true;
-            mp_mutex_unlock(&p->nav_lock);
+            dvd_begin_reset(p);
             break;
         default:
             break;
@@ -1130,13 +1193,15 @@ static int control(stream_t *stream, int cmd, void *arg)
         mp_mutex_lock(&priv->nav_lock);
         *out = (struct mp_nav_state_info){
             .menu_active = priv->menu_active,
-            .menu_transport = priv->menu_active,
+            .menu_transport = priv->menu_transport,
             .popup_available = false, // DVD has no Blu-ray-style popup menu
             .mouse_over_button = priv->mouse_over_button,
             .overlay_visible = priv->overlay_visible,
             .wait_pending = priv->wait_pending,
+            .reset_id = priv->reset_id,
             .still_seconds = priv->still_length,
             .overlay_change_id = priv->overlay_change_id,
+            .authored_audio_pid = -1,
         };
         mp_mutex_unlock(&priv->nav_lock);
         return STREAM_OK;
@@ -1146,12 +1211,20 @@ static int control(stream_t *stream, int cmd, void *arg)
             return STREAM_UNSUPPORTED;
         struct mp_nav_overlay *out = arg;
         mp_mutex_lock(&priv->nav_lock);
-        out->imgs = priv->pending_overlay; // transfer ownership
-        priv->pending_overlay = NULL;
-        out->change_id = priv->overlay_change_id;
-        out->w = priv->overlay_w;
-        out->h = priv->overlay_h;
-        out->wait_for_video = false;
+        if (priv->num_overlays > 0) {
+            *out = priv->overlay_queue[0];
+            MP_TARRAY_REMOVE_AT(priv->overlay_queue, priv->num_overlays, 0);
+        } else {
+            *out = (struct mp_nav_overlay){
+                .change_id = priv->overlay_change_id,
+                .w = priv->overlay_w,
+                .h = priv->overlay_h,
+                .menu_active = priv->menu_active,
+                .overlay_visible = priv->overlay_visible,
+                .mouse_over_button = priv->mouse_over_button,
+                .present_pts = -1,
+            };
+        }
         mp_mutex_unlock(&priv->nav_lock);
         return STREAM_OK;
     }
@@ -1224,8 +1297,11 @@ static void stream_dvdnav_close(stream_t *s)
 {
     struct priv *priv = s->priv;
     if (priv->use_nav) {
-        talloc_free(priv->pending_overlay);
-        priv->pending_overlay = NULL;
+        for (int n = 0; n < priv->num_overlays; n++)
+            talloc_free(priv->overlay_queue[n].imgs);
+        free(priv->overlay_queue);
+        priv->overlay_queue = NULL;
+        priv->num_overlays = 0;
         free(priv->cmd_queue);
         priv->cmd_queue = NULL;
         priv->num_cmds = 0;
@@ -1336,6 +1412,7 @@ static int open_s_internal(stream_t *stream)
         priv->cur_domain = -1;
         priv->spu_sub = -1;
         priv->spu_stream = -1;
+        priv->overlay_present_pts = -1;
         mp_mutex_init(&priv->nav_lock);
         dvd_update_video_res(priv);
         MP_VERBOSE(stream, "DVD menu navigation enabled\n");

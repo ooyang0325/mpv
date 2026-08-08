@@ -755,8 +755,11 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
 
     // Mark the current track selection as explicitly user-requested. (This is
     // different from auto-selection or disabling a track due to errors.)
-    if (flags & FLAG_MARK_SELECTION)
+    if (flags & FLAG_MARK_SELECTION) {
+        if (type == STREAM_AUDIO)
+            mp_nav_disable_authored_audio(mpctx);
         mark_track_selection(mpctx, order, type, track ? track->user_tid : -2);
+    }
 
     // No decoder should be initialized yet.
     if (!mpctx->demuxer)

@@ -120,6 +120,13 @@ struct bluray_priv_s {
     int current_angle;
     int current_title;
     int current_playlist;
+    int current_playitem;
+    uint32_t audio_stream_number;
+    unsigned playlist_epoch;
+    unsigned published_audio_epoch;
+    uint32_t published_audio_stream;
+    int authored_audio_pid;
+    int authored_audio_change_id;
     bool had_media_data;
     int pending_chapter;
     bool pending_chapter_from_menu;
@@ -508,6 +515,35 @@ static void queue_sound_effect(stream_t *s, uint32_t id)
 }
 #endif
 
+static void publish_authored_audio(struct bluray_priv_s *b)
+{
+    if (!b->use_nav)
+        return;
+
+    int pid = -1;
+    if (b->title_info && b->current_playitem >= 0 &&
+        b->current_playitem < b->title_info->clip_count)
+    {
+        BLURAY_CLIP_INFO *clip = &b->title_info->clips[b->current_playitem];
+        int index = mp_nav_bluray_stream_index(b->audio_stream_number,
+                                                clip->audio_stream_count);
+        if (index >= 0)
+            pid = clip->audio_streams[index].pid;
+    }
+
+    if (b->published_audio_epoch == b->playlist_epoch &&
+        b->published_audio_stream == b->audio_stream_number &&
+        b->authored_audio_pid == pid)
+        return;
+
+    b->published_audio_epoch = b->playlist_epoch;
+    b->published_audio_stream = b->audio_stream_number;
+    mp_mutex_lock(&b->nav_lock);
+    b->authored_audio_pid = pid;
+    b->authored_audio_change_id++;
+    mp_mutex_unlock(&b->nav_lock);
+}
+
 static void handle_event(stream_t *s, const BD_EVENT *ev)
 {
     struct bluray_priv_s *b = s->priv;
@@ -545,6 +581,8 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         break;
     case BD_EVENT_PLAYLIST:
         b->current_playlist = ev->param;
+        b->current_playitem = -1;
+        b->playlist_epoch++;
 #if HAVE_LIBBLURAY_GPR
         if (b->pending_chapter_from_menu) {
             uint32_t chapter = bd_get_gpr(b->bd, 3);
@@ -558,6 +596,7 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
             bd_free_title_info(b->title_info);
         b->title_info = bd_get_playlist_info(b->bd, b->current_playlist,
                                              b->current_angle);
+        publish_authored_audio(b);
         if (b->use_nav) {
             mp_mutex_lock(&b->nav_lock);
             b->duration = b->title_info
@@ -581,6 +620,14 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
                 b->pending_overlay_wait = true;
             mp_mutex_unlock(&b->nav_lock);
         }
+        break;
+    case BD_EVENT_PLAYITEM:
+        b->current_playitem = ev->param;
+        publish_authored_audio(b);
+        break;
+    case BD_EVENT_AUDIO_STREAM:
+        b->audio_stream_number = ev->param;
+        publish_authored_audio(b);
         break;
     case BD_EVENT_TITLE: {
 #if HAVE_LIBBLURAY_GPR
@@ -614,6 +661,7 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
             b->title_info = bd_get_playlist_info(b->bd, b->current_playlist,
                                                  b->current_angle);
         }
+        publish_authored_audio(b);
         break;
     case BD_EVENT_POPUP:
         if (b->use_nav) {
@@ -960,6 +1008,8 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
             .reset_id = b->reset_id,
             .still_seconds = b->still_length,
             .overlay_change_id = b->overlay_change_id,
+            .authored_audio_pid = b->authored_audio_pid,
+            .authored_audio_change_id = b->authored_audio_change_id,
         };
         mp_mutex_unlock(&b->nav_lock);
         mp_mutex_unlock(&b->bd_lock);
@@ -978,7 +1028,11 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         out->change_id = b->overlay_change_id;
         out->w = b->overlay_w;
         out->h = b->overlay_h;
+        out->menu_active = b->in_menu || b->ig_visible;
+        out->overlay_visible = b->overlay_visible;
+        out->mouse_over_button = b->mouse_over_button;
         out->wait_for_video = b->pending_overlay_wait;
+        out->present_pts = -1;
         mp_mutex_unlock(&b->nav_lock);
         mp_mutex_unlock(&b->bd_lock);
         return STREAM_OK;
@@ -1210,6 +1264,11 @@ static int bluray_stream_open_internal(stream_t *s)
     // these should be set before any callback
     b->current_angle = -1;
     b->current_title = -1;
+    b->current_playitem = -1;
+    b->audio_stream_number = 0xff;
+    b->published_audio_epoch = -1;
+    b->published_audio_stream = -1;
+    b->authored_audio_pid = -1;
 
     // initialize libbluray event queue
     bd_get_event(bd, NULL);
