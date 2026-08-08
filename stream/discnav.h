@@ -121,6 +121,15 @@ static inline int64_t mp_nav_dvd_hli_pts(int64_t current_pts,
     return current_pts + (int32_t)(hli_start - vobu_start);
 }
 
+static inline int64_t mp_nav_dvd_spu_pts(int64_t current_pts,
+                                         uint32_t vobu_start,
+                                         uint64_t spu_pts,
+                                         uint32_t display_offset)
+{
+    return current_pts + (int32_t)((uint32_t)spu_pts - vobu_start) +
+           display_offset;
+}
+
 static inline bool mp_nav_overlay_due(int64_t video_pts, int64_t present_pts)
 {
     return present_pts < 0 || (video_pts >= 0 && video_pts >= present_pts);

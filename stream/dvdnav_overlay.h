@@ -48,6 +48,7 @@ struct mp_dvdspu {
     uint8_t pal[4];    // CLUT index for sub-colors bg/pattern/emph1/emph2
     uint8_t alpha[4];  // 4-bit alpha (0..15) for the same sub-colors
     uint8_t *idx;      // w*h bytes, each 0..3 (malloc'd; free with free())
+    uint32_t start_pts; // display-control offset from PES PTS, in 90 kHz ticks
 };
 
 // One authored highlight: a button crop rectangle (video-plane, inclusive) and
@@ -167,19 +168,27 @@ static inline bool mp_dvdspu_decode(const uint8_t *buf, int len,
     int x1 = 0, y1 = 0, x2 = -1, y2 = -1;
     int top_off = -1, bot_off = -1;
     uint8_t pal[4] = {0}, alpha[4] = {0};
-    bool have_area = false, have_pixels = false;
+    bool have_area = false, have_pixels = false, have_start = false;
+    uint32_t start_pts = 0;
 
     // Walk the display control sequences; keep the first one that actually
     // starts a display with pixel data (that's the visible menu subpicture).
     for (int guard = 0; guard < 64 && dcsq + 4 <= len; guard++) {
+        uint16_t date = (buf[dcsq] << 8) | buf[dcsq + 1];
         int next = (buf[dcsq + 2] << 8) | buf[dcsq + 3];
         int p = dcsq + 4;
         bool done = false;
         while (p < len && !done) {
             int cmd = buf[p++];
             switch (cmd) {
-            case 0x00: // FSTA_DSP (forced start)
-            case 0x01: // STA_DSP (start display)
+            case 0x00: // FSTA_DSP (forced menu display at PES PTS)
+                have_start = true;
+                start_pts = 0;
+                break;
+            case 0x01: // STA_DSP (start display at DCSQ date)
+                have_start = true;
+                start_pts = (uint32_t)date << 10;
+                break;
             case 0x02: // STP_DSP (stop display)
                 break;
             case 0x03: // SET_COLOR
@@ -228,14 +237,14 @@ static inline bool mp_dvdspu_decode(const uint8_t *buf, int len,
                 break;
             }
         }
-        if (have_area && have_pixels)
+        if (have_start && have_area && have_pixels)
             break;
         if (next <= dcsq || next + 4 > len)
             break;
         dcsq = next;
     }
 
-    if (!have_area || !have_pixels)
+    if (!have_start || !have_area || !have_pixels)
         return false;
 
     int w = x2 - x1 + 1, h = y2 - y1 + 1;
@@ -258,6 +267,7 @@ static inline bool mp_dvdspu_decode(const uint8_t *buf, int len,
     memcpy(out->pal, pal, sizeof(pal));
     memcpy(out->alpha, alpha, sizeof(alpha));
     out->idx = idx;
+    out->start_pts = start_pts;
     return true;
 }
 

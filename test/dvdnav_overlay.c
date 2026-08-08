@@ -33,7 +33,7 @@ static const uint8_t spu_data[] = {
     0x00, 0x06,             // [2..3] first DCSQ at offset 6
     0x98,                   // [4] top field RLE: run(len2,col1), run(len2,col0)
     0x12,                   // [5] bottom field RLE: run(len4,col2)
-    0x00, 0x00,             // [6..7] DCSQ date
+    0x00, 0x02,             // [6..7] DCSQ date (2 * 1024 90 kHz ticks)
     0x00, 0x06,             // [8..9] next DCSQ = 6 (self -> terminates)
     0x01,                   // [10] STA_DSP
     0x03, 0x32, 0x10,       // [11..13] SET_COLOR -> pal = {0,1,2,3}
@@ -85,6 +85,7 @@ static void test_decode(void)
     assert_int_equal(spu.y, 0);
     assert_int_equal(spu.w, 4);
     assert_int_equal(spu.h, 2);
+    assert_int_equal(spu.start_pts, 2048);
 
     assert_int_equal(spu.pal[0], 0);
     assert_int_equal(spu.pal[1], 1);
@@ -281,6 +282,9 @@ static void test_overlay_timing(void)
     // hli_s_ptm wrapped past UINT32_MAX while the current VOBU is just before it.
     assert_int_equal(mp_nav_dvd_hli_pts(900000, 0xfffffff0, 0x00000020),
                      900048);
+    assert_int_equal(mp_nav_dvd_spu_pts(900000, 0xfffffff0,
+                                       0x00000020, 2048),
+                     902096);
 }
 
 static void test_bluray_audio_stream_index(void)

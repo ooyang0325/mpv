@@ -86,9 +86,11 @@ struct priv {
     int spu_accum_len;
     int spu_want;            // target size of the unit being assembled
     int spu_sub;            // substream id of the unit being assembled
+    int64_t spu_accum_pts;
     int spu_stream;          // active menu subpicture substream (0x20+phys, -1 any)
     struct mp_dvdspu spu;    // last fully decoded subpicture (spu.idx malloc'd)
     bool spu_valid;
+    int64_t spu_present_pts;
     bool overlay_dirty;      // overlay needs to be rebuilt/published
     bool on_still;           // currently parked on a STILL_FRAME (arm skip scope)
     int64_t still_deadline;  // mono ns to auto-skip a timed still (0: infinite/none)
@@ -329,15 +331,17 @@ static void dvd_reset_spu(struct priv *p)
     p->spu_accum_len = 0;
     p->spu_want = 0;
     p->spu_sub = -1;
+    p->spu_accum_pts = -1;
     mp_dvdspu_free(&p->spu);
     p->spu_valid = false;
+    p->spu_present_pts = -1;
     p->overlay_dirty = true;
 }
 
 // Accumulate subpicture (SPU) fragments demuxed out of the VOB into a whole
 // unit and decode it. A PES with a PTS starts a new unit; continuation packets
 // carry no PTS. Runs on the demuxer read thread only.
-static void dvd_spu_accumulate(stream_t *s, int substream, bool has_pts,
+static void dvd_spu_accumulate(stream_t *s, int substream, int64_t pts,
                                const uint8_t *data, int len)
 {
     struct priv *p = s->priv;
@@ -346,8 +350,9 @@ static void dvd_spu_accumulate(stream_t *s, int substream, bool has_pts,
     if (!mp_dvd_spu_wanted(p->spu_stream, substream))
         return;
 
-    if (has_pts) {
+    if (pts >= 0) {
         p->spu_accum_len = 0;
+        p->spu_accum_pts = pts;
         if (len < 2)
             return;
         int size = (data[0] << 8) | data[1];
@@ -374,10 +379,28 @@ static void dvd_spu_accumulate(stream_t *s, int substream, bool has_pts,
             mp_dvdspu_free(&p->spu);
             p->spu = decoded;
             p->spu_valid = true;
+            pci_t *pci = dvdnav_get_current_nav_pci(p->dvdnav);
+            p->spu_present_pts = p->spu_accum_pts >= 0 && pci
+                ? mp_nav_dvd_spu_pts(dvdnav_get_current_time(p->dvdnav),
+                    pci->pci_gi.vobu_s_ptm, p->spu_accum_pts,
+                    decoded.start_pts)
+                : -1;
             p->overlay_dirty = true;
         }
         p->spu_accum_len = 0;
     }
+}
+
+static int64_t dvd_pes_pts(const uint8_t *pes, int len)
+{
+    if (len < 14 || !(pes[7] & 0x80))
+        return -1;
+    const uint8_t *p = pes + 9;
+    return ((int64_t)(p[0] & 0x0e) << 29) |
+           ((int64_t)p[1] << 22) |
+           ((int64_t)(p[2] & 0xfe) << 14) |
+           ((int64_t)p[3] << 7) |
+           (p[4] >> 1);
 }
 
 // Peek at a DVD pack (2048-byte MPEG-2 program stream sector) and feed any
@@ -394,7 +417,7 @@ static void dvd_sniff_spu(stream_t *s, const uint8_t *buf)
         int sid = buf[pos + 3];
         int plen = (buf[pos + 4] << 8) | buf[pos + 5];
         if (sid == 0xBD && pos + 9 <= 2048 && (buf[pos + 6] & 0xC0) == 0x80) {
-            bool has_pts = (buf[pos + 7] & 0x80) != 0;
+            int64_t pts = dvd_pes_pts(buf + pos, 2048 - pos);
             int hdrlen = buf[pos + 8];
             int data = pos + 9 + hdrlen;
             int end = pos + 6 + plen;
@@ -402,7 +425,7 @@ static void dvd_sniff_spu(stream_t *s, const uint8_t *buf)
                 end = 2048;
             if (data < end) {
                 int substream = buf[data];
-                dvd_spu_accumulate(s, substream, has_pts,
+                dvd_spu_accumulate(s, substream, pts,
                                    buf + data + 1, end - (data + 1));
             }
         }
@@ -509,6 +532,8 @@ static void dvd_publish_overlay(stream_t *s)
     bool over_button = false;
     if (menu_domain && btn_ns > 0) {
         imgs = dvd_build_overlay(s, pci);
+        if (imgs && p->spu_present_pts >= 0)
+            present_pts = MPMAX(present_pts, p->spu_present_pts);
         int32_t button = 0;
         dvdnav_get_current_highlight(nav, &button);
         over_button = button > 0;
