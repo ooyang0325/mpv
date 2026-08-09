@@ -984,8 +984,14 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
     case STREAM_CTRL_NAV_CMD: {
         if (!b->use_nav)
             return STREAM_UNSUPPORTED;
+        struct mp_nav_cmd *nav_cmd = arg;
         mp_mutex_lock(&b->bd_lock);
-        apply_nav_command(b, arg);
+        mp_mutex_lock(&b->nav_lock);
+        bool current = nav_cmd->reset_id == b->reset_id &&
+                       nav_cmd->overlay_change_id == b->overlay_change_id;
+        mp_mutex_unlock(&b->nav_lock);
+        if (current)
+            apply_nav_command(b, nav_cmd);
         mp_mutex_unlock(&b->bd_lock);
         return STREAM_OK;
     }

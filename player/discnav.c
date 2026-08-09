@@ -317,7 +317,8 @@ void mp_handle_nav(struct MPContext *mpctx)
         mp_notify_property(mpctx, "disc-mouse-on-button");
 
     double duration;
-    if (stream_control(s, STREAM_CTRL_GET_TIME_LENGTH, &duration) == STREAM_OK &&
+    if (!nav->pending_overlay_valid &&
+        stream_control(s, STREAM_CTRL_GET_TIME_LENGTH, &duration) == STREAM_OK &&
         duration >= 0 && duration != mpctx->demuxer->duration)
     {
         mpctx->demuxer->duration = duration;

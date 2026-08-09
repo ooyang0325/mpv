@@ -130,6 +130,20 @@ static inline int64_t mp_nav_dvd_spu_pts(int64_t current_pts,
            display_offset;
 }
 
+static inline int64_t mp_nav_dvd_monotonic_pts(int64_t raw_pts,
+                                               int64_t duration_pts,
+                                               int64_t *base_pts,
+                                               int64_t *last_raw_pts)
+{
+    if (*last_raw_pts >= 0 && raw_pts < *last_raw_pts) {
+        *base_pts += raw_pts == 0
+            ? MPMAX(*last_raw_pts, duration_pts)
+            : *last_raw_pts - raw_pts;
+    }
+    *last_raw_pts = raw_pts;
+    return *base_pts + raw_pts;
+}
+
 static inline bool mp_nav_overlay_due(int64_t video_pts, int64_t present_pts)
 {
     return present_pts < 0 || (video_pts >= 0 && video_pts >= present_pts);

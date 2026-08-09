@@ -109,6 +109,9 @@ struct priv {
     bool menu_transport;
     bool mouse_over_button;
     int64_t overlay_present_pts;
+    int64_t nav_time_base;
+    int64_t last_nav_time;
+    int64_t current_present_pts;
     int still_length;        // 0: none, -1: infinite, >0: seconds
     bool reset_pending;      // nested demuxer should re-sync
     int reset_id;
@@ -381,7 +384,7 @@ static void dvd_spu_accumulate(stream_t *s, int substream, int64_t pts,
             p->spu_valid = true;
             pci_t *pci = dvdnav_get_current_nav_pci(p->dvdnav);
             p->spu_present_pts = p->spu_accum_pts >= 0 && pci
-                ? mp_nav_dvd_spu_pts(dvdnav_get_current_time(p->dvdnav),
+                ? mp_nav_dvd_spu_pts(p->current_present_pts,
                     pci->pci_gi.vobu_s_ptm, p->spu_accum_pts,
                     decoded.start_pts)
                 : -1;
@@ -507,6 +510,9 @@ static void dvd_begin_reset(struct priv *p)
     free(p->cmd_queue);
     p->cmd_queue = NULL;
     p->num_cmds = 0;
+    p->nav_time_base = 0;
+    p->last_nav_time = -1;
+    p->current_present_pts = 0;
     mp_mutex_unlock(&p->nav_lock);
 }
 
@@ -522,7 +528,7 @@ static void dvd_publish_overlay(stream_t *s)
     pci_t *pci = dvdnav_get_current_nav_pci(nav);
     bool hli_active = pci && menu_domain && (pci->hli.hl_gi.hli_ss & 3);
     int btn_ns = hli_active ? (pci->hli.hl_gi.btn_ns & 0x3f) : 0;
-    int64_t present_pts = dvdnav_get_current_time(nav);
+    int64_t present_pts = p->current_present_pts;
     if (hli_active) {
         present_pts = mp_nav_dvd_hli_pts(present_pts,
             pci->pci_gi.vobu_s_ptm, pci->hli.hl_gi.hli_s_ptm);
@@ -538,7 +544,6 @@ static void dvd_publish_overlay(stream_t *s)
         dvdnav_get_current_highlight(nav, &button);
         over_button = button > 0;
     }
-
     uint32_t w = p->video_w > 0 ? p->video_w : 720;
     uint32_t h = p->video_h > 0 ? p->video_h : 480;
 
@@ -789,6 +794,9 @@ static int dvd_nav_fill_buffer(stream_t *s, void *buf, int max_len)
             const char *name = LOOKUP_NAME(mp_dvdnav_events, event);
             MP_TRACE(s, "DVDNAV: event %s (%d).\n", name, event);
         }
+        p->current_present_pts = mp_nav_dvd_monotonic_pts(
+            dvdnav_get_current_time(nav), (int64_t)p->duration * 90,
+            &p->nav_time_base, &p->last_nav_time);
 
         // Track still-parked scope: any non-still event means we are no longer
         // waiting on a still.
@@ -1069,8 +1077,8 @@ static int control(stream_t *stream, int cmd, void *arg)
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_CURRENT_TIME: {
-        double tm;
-        tm = dvdnav_get_current_time(dvdnav) / 90000.0f;
+        double tm = (priv->use_nav ? priv->current_present_pts
+                                   : dvdnav_get_current_time(dvdnav)) / 90000.0;
         if (tm != -1) {
             *(double *)arg = tm;
             return STREAM_OK;
@@ -1130,6 +1138,11 @@ static int control(stream_t *stream, int cmd, void *arg)
         MP_VERBOSE(stream, "seek to PTS %f (%"PRId64")\n", d, tm);
         if (dvdnav_time_search(dvdnav, tm) != DVDNAV_STATUS_OK)
             break;
+        if (priv->use_nav) {
+            priv->nav_time_base = 0;
+            priv->last_nav_time = -1;
+            priv->current_present_pts = 0;
+        }
         stream_drop_buffers(stream);
         d = dvdnav_get_current_time(dvdnav) / 90000.0f;
         MP_VERBOSE(stream, "landed at: %f\n", d);
@@ -1438,6 +1451,7 @@ static int open_s_internal(stream_t *stream)
         priv->spu_sub = -1;
         priv->spu_stream = -1;
         priv->overlay_present_pts = -1;
+        priv->last_nav_time = -1;
         mp_mutex_init(&priv->nav_lock);
         dvd_update_video_res(priv);
         MP_VERBOSE(stream, "DVD menu navigation enabled\n");

@@ -285,6 +285,21 @@ static void test_overlay_timing(void)
     assert_int_equal(mp_nav_dvd_spu_pts(900000, 0xfffffff0,
                                        0x00000020, 2048),
                      902096);
+
+    int64_t base = 0, last = -1;
+    assert_int_equal(mp_nav_dvd_monotonic_pts(0, 900000, &base, &last), 0);
+    assert_int_equal(mp_nav_dvd_monotonic_pts(858000, 900000, &base, &last),
+                     858000);
+    assert_int_equal(mp_nav_dvd_monotonic_pts(0, 900000, &base, &last),
+                     900000);
+    assert_int_equal(mp_nav_dvd_monotonic_pts(25257, 900000, &base, &last),
+                     925257);
+
+    base = 0;
+    last = 20 * 90000;
+    assert_int_equal(mp_nav_dvd_monotonic_pts(10 * 90000, 30 * 90000,
+                                              &base, &last),
+                     20 * 90000);
 }
 
 static void test_bluray_audio_stream_index(void)
