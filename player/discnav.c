@@ -40,6 +40,7 @@
 
 #include "demux/demux.h"
 
+#include "sub/dec_sub.h"
 #include "sub/osd.h"
 
 // Poll iterations the audio output must stay starved during a disc hold before
@@ -73,6 +74,12 @@ struct mp_nav_state {
     int pending_audio_change_id;
     int pending_audio_pid;
     bool authored_audio_disabled;
+    int applied_subtitle_change_id;
+    int pending_subtitle_change_id;
+    int pending_subtitle_pid;
+    bool pending_subtitle_enabled;
+    bool authored_subtitle_disabled;
+    struct track *authored_subtitle_track;
 };
 
 // Return the disc stream if the current demuxer is a disc menu stream
@@ -119,6 +126,10 @@ void mp_nav_destroy(struct MPContext *mpctx)
         return;
     if (mpctx->nav_state->audio_idled && mpctx->ao)
         ao_set_paused(mpctx->ao, get_internal_paused(mpctx), false);
+    if (mpctx->nav_state->authored_subtitle_track &&
+        mpctx->nav_state->authored_subtitle_track->d_sub)
+        sub_set_forced_only(mpctx->nav_state->authored_subtitle_track->d_sub,
+                            false);
     osd_set_nav(mpctx->osd, NULL);
     talloc_free(mpctx->nav_state);
     mpctx->nav_state = NULL;
@@ -180,6 +191,77 @@ static void apply_authored_audio(struct MPContext *mpctx,
     nav->applied_audio_change_id = nav->pending_audio_change_id;
 }
 
+static void apply_authored_subtitle(struct MPContext *mpctx,
+                                    struct mp_nav_state_info *info)
+{
+    struct mp_nav_state *nav = mpctx->nav_state;
+    if (info->authored_subtitle_change_id !=
+            nav->pending_subtitle_change_id &&
+        info->authored_subtitle_change_id !=
+            nav->applied_subtitle_change_id)
+    {
+        nav->pending_subtitle_change_id =
+            info->authored_subtitle_change_id;
+        nav->pending_subtitle_pid = info->authored_subtitle_pid;
+        nav->pending_subtitle_enabled = info->authored_subtitle_enabled;
+    }
+
+    if (nav->pending_subtitle_change_id == nav->applied_subtitle_change_id)
+        return;
+    if (nav->authored_subtitle_disabled) {
+        nav->applied_subtitle_change_id = nav->pending_subtitle_change_id;
+        return;
+    }
+    if (!mpctx->restart_complete || mpctx->playback_pts == MP_NOPTS_VALUE)
+        return;
+
+    if (nav->pending_subtitle_pid < 0) {
+        struct track *owned = nav->authored_subtitle_track;
+        if (owned && owned->d_sub)
+            sub_set_forced_only(owned->d_sub, false);
+        if (mpctx->current_track[0][STREAM_SUB] == owned)
+            mp_switch_track(mpctx, STREAM_SUB, NULL, 0);
+        nav->authored_subtitle_track = NULL;
+        nav->applied_subtitle_change_id = nav->pending_subtitle_change_id;
+        return;
+    }
+
+    struct track *target = NULL;
+    for (int n = 0; n < mpctx->num_tracks; n++) {
+        struct track *track = mpctx->tracks[n];
+        if (track->type == STREAM_SUB && !track->is_external &&
+            track->demuxer == mpctx->demuxer && track->stream &&
+            track->stream->codec &&
+            track->demuxer_id == nav->pending_subtitle_pid &&
+            !strcmp(track->stream->codec->codec, "hdmv_pgs_subtitle"))
+        {
+            target = track;
+            break;
+        }
+    }
+    if (!target)
+        return;
+
+    if (target->selected &&
+        mpctx->current_track[0][STREAM_SUB] != target)
+        return;
+    if (nav->authored_subtitle_track &&
+        nav->authored_subtitle_track != target &&
+        nav->authored_subtitle_track->d_sub)
+        sub_set_forced_only(nav->authored_subtitle_track->d_sub, false);
+    if (mpctx->current_track[0][STREAM_SUB] != target)
+        mp_switch_track(mpctx, STREAM_SUB, target, 0);
+    if (mpctx->current_track[0][STREAM_SUB] != target)
+        return;
+    if (target->d_sub) {
+        sub_set_forced_only(target->d_sub,
+                            !nav->pending_subtitle_enabled);
+        target->redraw_subs = true;
+    }
+    nav->authored_subtitle_track = target;
+    nav->applied_subtitle_change_id = nav->pending_subtitle_change_id;
+}
+
 void mp_handle_nav(struct MPContext *mpctx)
 {
     struct stream *s = get_nav_stream(mpctx);
@@ -197,6 +279,10 @@ void mp_handle_nav(struct MPContext *mpctx)
         mpctx->nav_state->applied_overlay_change_id = -1;
         mpctx->nav_state->applied_audio_change_id = -1;
         mpctx->nav_state->pending_audio_change_id = -1;
+        mpctx->nav_state->applied_subtitle_change_id = -1;
+        mpctx->nav_state->pending_subtitle_change_id = -1;
+        mpctx->nav_state->authored_subtitle_disabled =
+            mpctx->opts->stream_id[0][STREAM_SUB] != -1;
         MP_VERBOSE(mpctx->nav_state, "enabling disc menu navigation\n");
     }
     struct mp_nav_state *nav = mpctx->nav_state;
@@ -219,6 +305,7 @@ void mp_handle_nav(struct MPContext *mpctx)
     }
 
     apply_authored_audio(mpctx, &info);
+    apply_authored_subtitle(mpctx, &info);
 
     struct mp_osd_res res = osd_get_vo_res(mpctx->osd);
     int64_t video_pts = mpctx->video_pts == MP_NOPTS_VALUE
@@ -447,6 +534,17 @@ void mp_nav_disable_authored_audio(struct MPContext *mpctx)
 {
     if (mpctx->nav_state)
         mpctx->nav_state->authored_audio_disabled = true;
+}
+
+void mp_nav_disable_authored_subtitle(struct MPContext *mpctx)
+{
+    if (!mpctx->nav_state)
+        return;
+    struct track *track = mpctx->nav_state->authored_subtitle_track;
+    if (track && track->d_sub)
+        sub_set_forced_only(track->d_sub, false);
+    mpctx->nav_state->authored_subtitle_track = NULL;
+    mpctx->nav_state->authored_subtitle_disabled = true;
 }
 
 bool mp_nav_menu_active(struct MPContext *mpctx)

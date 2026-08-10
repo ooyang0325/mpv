@@ -72,6 +72,7 @@ struct dec_sub {
     double video_fps;
     double sub_speed;
     bool sub_visible;
+    bool forced_events_only;
 
     struct mp_codec_params *codec;
     double start, end;
@@ -174,6 +175,7 @@ static struct sd *init_decoder(struct dec_sub *sub)
             .codec = sub->codec,
             .lang = sub->lang,
             .preload_ok = true,
+            .forced_events_only = sub->forced_events_only,
         };
 
         if (sd->driver->init(sd) >= 0)
@@ -562,6 +564,21 @@ void sub_set_play_dir(struct dec_sub *sub, int dir)
 {
     mp_mutex_lock(&sub->lock);
     sub->play_dir = dir;
+    mp_mutex_unlock(&sub->lock);
+}
+
+void sub_set_forced_only(struct dec_sub *sub, bool forced_only)
+{
+    mp_mutex_lock(&sub->lock);
+    if (sub->forced_events_only != forced_only) {
+        sub->forced_events_only = forced_only;
+        sub->sd->forced_events_only = forced_only;
+        if (sub->sd->driver->reset)
+            sub->sd->driver->reset(sub->sd);
+        for (int n = sub->cached_pkt_pos; n < sub->num_cached_pkts; n++)
+            sub->sd->driver->decode(sub->sd, sub->cached_pkts[n]);
+        sub->last_vo_pts = MP_NOPTS_VALUE;
+    }
     mp_mutex_unlock(&sub->lock);
 }
 

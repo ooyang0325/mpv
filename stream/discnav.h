@@ -40,6 +40,9 @@ struct mp_nav_state_info {
     int overlay_change_id;   // bumped whenever the overlay bitmaps change
     int authored_audio_pid;  // MPEG-TS PID selected by the authored menu, or -1
     int authored_audio_change_id;
+    int authored_subtitle_pid; // PGS PID selected by the authored menu, or -1
+    bool authored_subtitle_enabled;
+    int authored_subtitle_change_id;
 };
 
 // Whether the player pipeline has drained to a DVDNAV_WAIT boundary and the

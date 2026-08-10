@@ -34,6 +34,7 @@ struct sd {
     // Set to false as soon as the decoder discards old subtitle events.
     // (only needed if sd_functions.accept_packets_in_advance == false)
     bool preload_ok;
+    bool forced_events_only;
 };
 
 struct sd_functions {

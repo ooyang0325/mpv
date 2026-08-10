@@ -1240,6 +1240,7 @@ static int control(stream_t *stream, int cmd, void *arg)
             .still_seconds = priv->still_length,
             .overlay_change_id = priv->overlay_change_id,
             .authored_audio_pid = -1,
+            .authored_subtitle_pid = -1,
         };
         mp_mutex_unlock(&priv->nav_lock);
         return STREAM_OK;

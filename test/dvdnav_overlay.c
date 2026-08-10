@@ -308,6 +308,7 @@ static void test_bluray_audio_stream_index(void)
     assert_int_equal(mp_nav_bluray_stream_index(2, 2), 1);
     assert_int_equal(mp_nav_bluray_stream_index(0, 2), -1);
     assert_int_equal(mp_nav_bluray_stream_index(0xff, 2), -1);
+    assert_int_equal(mp_nav_bluray_stream_index(0xfff, 2), -1);
     assert_int_equal(mp_nav_bluray_stream_index(3, 2), -1);
 }
 

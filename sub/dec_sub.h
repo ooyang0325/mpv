@@ -71,6 +71,7 @@ void sub_reset(struct dec_sub *sub);
 void sub_select(struct dec_sub *sub, bool selected);
 void sub_set_recorder_sink(struct dec_sub *sub, struct mp_recorder_sink *sink);
 void sub_set_play_dir(struct dec_sub *sub, int dir);
+void sub_set_forced_only(struct dec_sub *sub, bool forced_only);
 bool sub_is_primary_visible(struct dec_sub *sub);
 bool sub_is_secondary_visible(struct dec_sub *sub);
 

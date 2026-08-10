@@ -127,9 +127,20 @@ struct bluray_priv_s {
     uint32_t published_audio_stream;
     int authored_audio_pid;
     int authored_audio_change_id;
+    uint32_t pg_stream_number;
+    bool pg_enabled;
+    unsigned published_pg_epoch;
+    uint32_t published_pg_stream;
+    bool published_pg_enabled;
+    int authored_subtitle_pid;
+    int authored_subtitle_change_id;
     bool had_media_data;
     int pending_chapter;
-    bool pending_chapter_from_menu;
+    bool gpr_fallback_allowed;
+#if HAVE_LIBBLURAY_GPR
+    uint32_t top_menu_gpr3;
+    bool top_menu_gpr3_valid;
+#endif
 
     int cfg_title;
     int cfg_playlist;
@@ -167,6 +178,7 @@ struct bluray_priv_s {
     bool transition_overlay_pending;
     uint8_t *held_data;          // event-associated bytes replayed after reset
     int held_len, held_pos;
+    bool chapter_probe;
 
     // Pending authored menu sound effects (BD_EVENT_SOUND_EFFECT). Copied out
     // of libbluray on this (stream) thread and drained by the player through
@@ -544,6 +556,38 @@ static void publish_authored_audio(struct bluray_priv_s *b)
     mp_mutex_unlock(&b->nav_lock);
 }
 
+static void publish_authored_subtitle(struct bluray_priv_s *b)
+{
+    if (!b->use_nav)
+        return;
+
+    int pid = -1;
+    if (b->title_info && b->current_playitem >= 0 &&
+        b->current_playitem < b->title_info->clip_count)
+    {
+        BLURAY_CLIP_INFO *clip = &b->title_info->clips[b->current_playitem];
+        int index = mp_nav_bluray_stream_index(b->pg_stream_number,
+                                                clip->pg_stream_count);
+        if (index >= 0 &&
+            clip->pg_streams[index].coding_type == BLURAY_STREAM_TYPE_SUB_PG)
+            pid = clip->pg_streams[index].pid;
+    }
+
+    if (b->published_pg_epoch == b->playlist_epoch &&
+        b->published_pg_stream == b->pg_stream_number &&
+        b->published_pg_enabled == b->pg_enabled &&
+        b->authored_subtitle_pid == pid)
+        return;
+
+    b->published_pg_epoch = b->playlist_epoch;
+    b->published_pg_stream = b->pg_stream_number;
+    b->published_pg_enabled = b->pg_enabled;
+    mp_mutex_lock(&b->nav_lock);
+    b->authored_subtitle_pid = pid;
+    b->authored_subtitle_change_id++;
+    mp_mutex_unlock(&b->nav_lock);
+}
+
 static void handle_event(stream_t *s, const BD_EVENT *ev)
 {
     struct bluray_priv_s *b = s->priv;
@@ -583,13 +627,6 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         b->current_playlist = ev->param;
         b->current_playitem = -1;
         b->playlist_epoch++;
-#if HAVE_LIBBLURAY_GPR
-        if (b->pending_chapter_from_menu) {
-            uint32_t chapter = bd_get_gpr(b->bd, 3);
-            b->pending_chapter = chapter > 0 ? chapter : -1;
-            b->pending_chapter_from_menu = false;
-        }
-#endif
         if (!b->use_nav)
             b->current_title = bd_get_current_title(b->bd);
         if (b->title_info)
@@ -597,17 +634,12 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         b->title_info = bd_get_playlist_info(b->bd, b->current_playlist,
                                              b->current_angle);
         publish_authored_audio(b);
+        publish_authored_subtitle(b);
         if (b->use_nav) {
             mp_mutex_lock(&b->nav_lock);
             b->duration = b->title_info
                 ? BD_TIME_TO_MP(b->title_info->duration) : -1;
             mp_mutex_unlock(&b->nav_lock);
-        }
-        if (b->pending_chapter >= 0 && b->title_info &&
-            b->pending_chapter < b->title_info->chapter_count)
-        {
-            bd_seek_chapter(b->bd, b->pending_chapter);
-            b->pending_chapter = -1;
         }
         if (b->use_nav && b->had_media_data) {
             mp_mutex_lock(&b->nav_lock);
@@ -624,10 +656,19 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
     case BD_EVENT_PLAYITEM:
         b->current_playitem = ev->param;
         publish_authored_audio(b);
+        publish_authored_subtitle(b);
         break;
     case BD_EVENT_AUDIO_STREAM:
         b->audio_stream_number = ev->param;
         publish_authored_audio(b);
+        break;
+    case BD_EVENT_PG_TEXTST_STREAM:
+        b->pg_stream_number = ev->param;
+        publish_authored_subtitle(b);
+        break;
+    case BD_EVENT_PG_TEXTST:
+        b->pg_enabled = ev->param != 0;
+        publish_authored_subtitle(b);
         break;
     case BD_EVENT_TITLE: {
 #if HAVE_LIBBLURAY_GPR
@@ -638,10 +679,20 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
         } else
             b->current_title = ev->param;
 #if HAVE_LIBBLURAY_GPR
-        // ponytail: some HDMV menus hand a zero-based chapter through GPR3
-        // immediately before the following PLAYLIST event.
-        b->pending_chapter_from_menu =
-            old_title == BLURAY_TITLE_TOP_MENU && b->current_title > 0;
+        if (b->current_title == BLURAY_TITLE_TOP_MENU) {
+            b->top_menu_gpr3 = bd_get_gpr(b->bd, 3);
+            b->top_menu_gpr3_valid = true;
+            b->pending_chapter = -1;
+        } else if (b->gpr_fallback_allowed &&
+                   old_title == BLURAY_TITLE_TOP_MENU &&
+                   b->current_title > 0)
+        {
+            uint32_t chapter = bd_get_gpr(b->bd, 3);
+            b->pending_chapter = b->top_menu_gpr3_valid &&
+                                 chapter != b->top_menu_gpr3 && chapter > 0
+                ? chapter : -1;
+            b->top_menu_gpr3_valid = false;
+        }
 #endif
         if (b->title_info) {
             bd_free_title_info(b->title_info);
@@ -662,6 +713,7 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
                                                  b->current_angle);
         }
         publish_authored_audio(b);
+        publish_authored_subtitle(b);
         break;
     case BD_EVENT_POPUP:
         if (b->use_nav) {
@@ -694,6 +746,8 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
 #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 6, 0)
     case BD_EVENT_PLAYLIST_STOP:
     case BD_EVENT_SEEK:
+        if (ev->event == BD_EVENT_SEEK)
+            b->pending_chapter = -1;
         // Both cross a media boundary within the same navigation session and
         // require the nested demuxer to flush and re-sync.
         if (b->use_nav && b->had_media_data) {
@@ -740,6 +794,31 @@ static int bdnav_stream_fill_buffer(stream_t *s, void *buf, int len)
             mp_mutex_unlock(&b->nav_lock);
         }
 
+        if (b->chapter_probe) {
+            bool discard = false;
+            mp_mutex_lock(&b->bd_lock);
+            BD_EVENT queued;
+            while (bd_get_event(b->bd, &queued))
+                handle_event(s, &queued);
+            if (b->pending_chapter < 0) {
+                discard = true; // native SEEK won; bytes precede its target
+            } else {
+                int chapter = b->pending_chapter;
+                b->pending_chapter = -1;
+                if (b->title_info && chapter < b->title_info->chapter_count &&
+                    bd_seek_chapter(b->bd, chapter) >= 0)
+                    discard = true;
+            }
+            mp_mutex_unlock(&b->bd_lock);
+            b->chapter_probe = false;
+            if (discard) {
+                talloc_free(b->held_data);
+                b->held_data = NULL;
+                b->held_len = b->held_pos = 0;
+                continue;
+            }
+        }
+
         if (b->held_data) {
             int copy = MPMIN(len, b->held_len - b->held_pos);
             memcpy(buf, b->held_data + b->held_pos, copy);
@@ -765,7 +844,16 @@ static int bdnav_stream_fill_buffer(stream_t *s, void *buf, int len)
         // resulting transition.
         if (event.event != BD_EVENT_NONE)
             handle_event(s, &event);
+        if (read > 0 && b->pending_chapter >= 0) {
+            talloc_free(b->held_data);
+            b->held_data = talloc_memdup(b, buf, read);
+            b->held_len = read;
+            b->held_pos = 0;
+            b->chapter_probe = true;
+        }
         mp_mutex_unlock(&b->bd_lock);
+        if (b->chapter_probe)
+            continue;
 
         mp_mutex_lock(&b->nav_lock);
         reset_hold = b->reset_hold;
@@ -1016,6 +1104,9 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
             .overlay_change_id = b->overlay_change_id,
             .authored_audio_pid = b->authored_audio_pid,
             .authored_audio_change_id = b->authored_audio_change_id,
+            .authored_subtitle_pid = b->authored_subtitle_pid,
+            .authored_subtitle_enabled = b->pg_enabled,
+            .authored_subtitle_change_id = b->authored_subtitle_change_id,
         };
         mp_mutex_unlock(&b->nav_lock);
         mp_mutex_unlock(&b->bd_lock);
@@ -1128,6 +1219,9 @@ static bool check_disc_info(stream_t *s)
 {
     struct bluray_priv_s *b = s->priv;
     const BLURAY_DISC_INFO *info = bd_get_disc_info(b->bd);
+#if HAVE_LIBBLURAY_GPR
+    b->gpr_fallback_allowed = !info->bdj_detected;
+#endif
 
     // check Blu-ray
     if (!info->bluray_detected) {
@@ -1271,10 +1365,15 @@ static int bluray_stream_open_internal(stream_t *s)
     b->current_angle = -1;
     b->current_title = -1;
     b->current_playitem = -1;
+    b->pending_chapter = -1;
     b->audio_stream_number = 0xff;
     b->published_audio_epoch = -1;
     b->published_audio_stream = -1;
     b->authored_audio_pid = -1;
+    b->pg_stream_number = 0xfff;
+    b->published_pg_epoch = -1;
+    b->published_pg_stream = -1;
+    b->authored_subtitle_pid = -1;
 
     // initialize libbluray event queue
     bd_get_event(bd, NULL);

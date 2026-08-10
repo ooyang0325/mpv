@@ -758,6 +758,8 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
     if (flags & FLAG_MARK_SELECTION) {
         if (type == STREAM_AUDIO)
             mp_nav_disable_authored_audio(mpctx);
+        if (type == STREAM_SUB && order == 0)
+            mp_nav_disable_authored_subtitle(mpctx);
         mark_track_selection(mpctx, order, type, track ? track->user_tid : -2);
     }
 
