@@ -618,7 +618,9 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
         struct pl_video_osd_entry *entry = &state->entries[item->render_index];
         pl_fmt tex_fmt = p->osd_fmt[item->format];
 
-        if (entry->change_id != item->change_id) {
+        if (item->format == SUBBITMAP_BGRA ||
+            entry->change_id != item->change_id)
+        {
             if (!entry->tex)
                 MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
 
