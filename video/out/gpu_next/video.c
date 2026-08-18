@@ -652,25 +652,28 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
                 break;
             }
 
-            entry->num_parts = 0;
-            MP_TARRAY_GROW(p, entry->parts, item->num_parts);
-            for (int i = 0; i < item->num_parts; i++) {
-                const struct sub_bitmap *b = &item->parts[i];
-                if (b->dw == 0 || b->dh == 0)
-                    continue;
-                uint32_t c = b->libass.color;
-                entry->parts[entry->num_parts++] = (struct pl_overlay_part) {
-                    .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
-                    .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
-                    .color = {
-                        (c >> 24) / 255.0f,
-                        ((c >> 16) & 0xFF) / 255.0f,
-                        ((c >> 8) & 0xFF) / 255.0f,
-                        (255 - (c & 0xFF)) / 255.0f,
-                    },
-                };
-            }
             entry->change_id = item->change_id;
+        }
+
+        // Bitmap placement can change without new packed pixels (for example,
+        // window scaling or PGS composition updates), so only cache the atlas.
+        entry->num_parts = 0;
+        MP_TARRAY_GROW(p, entry->parts, item->num_parts);
+        for (int i = 0; i < item->num_parts; i++) {
+            const struct sub_bitmap *b = &item->parts[i];
+            if (b->dw == 0 || b->dh == 0)
+                continue;
+            uint32_t c = b->libass.color;
+            entry->parts[entry->num_parts++] = (struct pl_overlay_part) {
+                .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
+                .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
+                .color = {
+                    (c >> 24) / 255.0f,
+                    ((c >> 16) & 0xFF) / 255.0f,
+                    ((c >> 8) & 0xFF) / 255.0f,
+                    (255 - (c & 0xFF)) / 255.0f,
+                },
+            };
         }
 
         // Create the final pl_overlay structure for rendering.
