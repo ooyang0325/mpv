@@ -643,13 +643,8 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
                 .row_pitch  = item->packed->stride[0],
                 .ptr        = item->packed->planes[0],
             };
-            if (p->ra->gpu->limits.callbacks) {
-                upload.callback = talloc_free;
-                upload.priv = mp_image_new_ref(item->packed);
-            }
             ok = pl_tex_upload(p->ra->gpu, &upload);
             if (!ok) {
-                talloc_free(upload.priv);
                 mp_msg(p->log, MSGL_ERR, "Failed uploading OSD texture!\n");
                 break;
             }
