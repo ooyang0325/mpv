@@ -42,6 +42,7 @@ struct pl_video_osd_entry {
     pl_tex tex;                     // The GPU texture containing the bitmap for this OSD part.
     struct pl_overlay_part *parts;  // Array of parts describing how to render the texture.
     int num_parts;                  // The number of parts in the array.
+    int change_id;
 };
 
 /**
@@ -77,6 +78,7 @@ struct pl_video {
     uint64_t last_frame_id;// To avoid pushing duplicate frames into the queue.
     double last_pts;       // Last presentation timestamp we rendered at, for redraws.
     bool warned_no_nlq;    // Only complain once per session about a droppable EL.
+    bool want_reset;
 
     // Render State
     struct mp_image_params current_params; // Current video parameters (resolution, colorspace, etc.).
@@ -89,6 +91,10 @@ struct pl_video {
     pl_fmt osd_fmt[SUBBITMAP_COUNT];             // Cached libplacebo formats for different OSD bitmap types.
     pl_tex *sub_tex; // Texture pool for OSD textures.
     int num_sub_tex; // The number of textures in the pool.
+#if PL_API_VER >= 367
+    pl_tex *el_tex;
+    int num_el_tex;
+#endif
 
     // Color adjustment state
     struct mp_csp_equalizer_state *video_eq; // Manages brightness, contrast, hue, etc.
@@ -117,6 +123,7 @@ struct frame_priv {
     // Dolby Vision profile 7 enhancement layer, paired onto the base layer by
     // the filter chain. Only valid while `has_el` is set.
     struct pl_frame el_frame;
+    pl_tex el_tex[4];
     struct ra_hwdec *el_hwdec;
     bool has_el;
 #endif
@@ -219,20 +226,17 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
     return true;
 }
 
-static void hwdec_sync(pl_gpu gpu, struct mp_image *mpi, struct frame_priv *fp)
+static void hwdec_sync(pl_gpu gpu, struct mp_image *mpi, struct frame_priv *fp,
+                       struct ra_hwdec_mapper *mapper)
 {
     if (fp->hwdec_synced)
         return;
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     struct pl_video *p = fp->p;
-    // Guard the base mapper: this function is also reached from hwdec_release_el(),
-    // where the *enhancement* layer is hardware-decoded but the base layer may not be,
-    // in which case p->hwdec_mapper was never created. It can also be NULL after a
-    // mid-stream params change whose mapper re-creation failed.
-    if (!p->hwdec_mapper)
+    if (!mapper)
         goto finish;
-    struct ra *ra = p->hwdec_mapper->ra;
+    struct ra *ra = mapper->ra;
     if (ra_is_gl(ra)) {
         GL *gl = ra_gl_get(ra);
         if (!gl->FenceSync || !gl->ClientWaitSync || !gl->DeleteSync)
@@ -284,7 +288,7 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
-    hwdec_sync(gpu, mpi, fp);
+    hwdec_sync(gpu, mpi, fp, p->hwdec_mapper);
     if (!ra_pl_get(p->hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
@@ -320,7 +324,7 @@ static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *bl = frame->user_data;
     struct frame_priv *fp = bl->priv;
     struct pl_video *p = fp->p;
-    hwdec_sync(gpu, bl, fp);
+    hwdec_sync(gpu, bl, fp, p->el_hwdec_mapper);
     if (!ra_pl_get(p->el_hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->ra->gpu, &frame->planes[n].texture);
@@ -383,7 +387,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         frame->release = hwdec_release;
         setup_hwdec_plane_mapping(frame, &desc);
     } else {
-        if (!ra_upload_mp_image(p->ra, frame, mpi)) {
+        if (!ra_upload_mp_image(p->ra, frame, mpi, tex)) {
             talloc_free(mpi);
             return false;
         }
@@ -426,7 +430,9 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
             fp->el_frame.release = hwdec_release_el;
             setup_hwdec_plane_mapping(&fp->el_frame, &desc);
         } else if (el_ok) {
-            el_ok = ra_upload_mp_image(p->ra, &fp->el_frame, el);
+            for (int n = 0; n < 4; n++)
+                MP_TARRAY_POP(p->el_tex, p->num_el_tex, &fp->el_tex[n]);
+            el_ok = ra_upload_mp_image(p->ra, &fp->el_frame, el, fp->el_tex);
             fp->el_frame.user_data = mpi;
         }
 
@@ -482,17 +488,15 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     struct pl_video *p = fp->p;
 
 #if PL_API_VER >= 367
-    // The enhancement layer keeps its own textures, and is not reachable from
-    // `frame` once the renderer is done with it.
-    if (fp->has_el) {
-        if (!fp->el_hwdec)
-            ra_cleanup_pl_frame(p->ra, &fp->el_frame);
-        fp->has_el = false;
+    if (!fp->el_hwdec) {
+        for (int n = 0; n < MP_ARRAY_SIZE(fp->el_tex); n++) {
+            if (fp->el_tex[n])
+                MP_TARRAY_APPEND(p, p->el_tex, p->num_el_tex, fp->el_tex[n]);
+        }
     }
+    fp->has_el = false;
 #endif
 
-    if (!fp->hwdec)
-        ra_cleanup_pl_frame(p->ra, frame);
     // Free the mp_image reference itself.
     talloc_free(mpi);
 }
@@ -547,7 +551,9 @@ void pl_video_uninit(struct pl_video **p_ptr) {
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     if (p->num_hwdec_fences) {
         pl_gpu_finish(p->ra->gpu);
-        GL *gl = ra_gl_get(p->hwdec_mapper->ra);
+        struct ra_hwdec_mapper *mapper =
+            p->hwdec_mapper ? p->hwdec_mapper : p->el_hwdec_mapper;
+        GL *gl = ra_gl_get(mapper->ra);
         for (int i = 0; i < p->num_hwdec_fences; i++) {
             gl->DeleteSync(p->hwdec_fences[i].sync);
             mp_image_unrefp(&p->hwdec_fences[i].image);
@@ -567,6 +573,11 @@ void pl_video_uninit(struct pl_video **p_ptr) {
         pl_tex_destroy(p->ra->gpu, &p->sub_tex[i]);
     }
     talloc_free(p->sub_tex);
+#if PL_API_VER >= 367
+    for (int i = 0; i < p->num_el_tex; i++)
+        pl_tex_destroy(p->ra->gpu, &p->el_tex[i]);
+    talloc_free(p->el_tex);
+#endif
 
     talloc_free(p);
     *p_ptr = NULL;
@@ -607,56 +618,59 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
         struct pl_video_osd_entry *entry = &state->entries[item->render_index];
         pl_fmt tex_fmt = p->osd_fmt[item->format];
 
-        // Reuse a texture from the pool if available.
-        if (!entry->tex)
-            MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
+        if (entry->change_id != item->change_id) {
+            if (!entry->tex)
+                MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
 
-        // Recreate the texture if its size needs to change.
-        bool ok = pl_tex_recreate(p->ra->gpu, &entry->tex, &(struct pl_tex_params) {
-            .format = tex_fmt,
-            .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
-            .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
-            .host_writable = true,
-            .sampleable = true,
-        });
-        if (!ok) {
-            mp_msg(p->log, MSGL_ERR, "Failed recreating OSD texture!\n");
-            break;
-        }
+            bool ok = pl_tex_recreate(p->ra->gpu, &entry->tex,
+                                      &(struct pl_tex_params) {
+                .format = tex_fmt,
+                .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
+                .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
+                .host_writable = true,
+                .sampleable = true,
+            });
+            if (!ok) {
+                mp_msg(p->log, MSGL_ERR, "Failed recreating OSD texture!\n");
+                break;
+            }
 
-        // Upload the new bitmap data to the GPU texture.
-        ok = pl_tex_upload(p->ra->gpu, &(struct pl_tex_transfer_params) {
-            .tex        = entry->tex,
-            .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
-            .row_pitch  = item->packed->stride[0],
-            .ptr        = item->packed->planes[0],
-        });
-        if (!ok) {
-            mp_msg(p->log, MSGL_ERR, "Failed uploading OSD texture!\n");
-            break;
-        }
-
-        entry->num_parts = 0;
-        talloc_free(entry->parts);
-        entry->parts = talloc_array(p, struct pl_overlay_part, item->num_parts);
-
-        // Convert each sub-bitmap part into a pl_overlay_part.
-        for (int i = 0; i < item->num_parts; i++) {
-            const struct sub_bitmap *b = &item->parts[i];
-            if (b->dw == 0 || b->dh == 0)
-                continue;
-            uint32_t c = b->libass.color;
-            struct pl_overlay_part part = {
-                .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
-                .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
-                .color = {
-                    (c >> 24) / 255.0f,
-                    ((c >> 16) & 0xFF) / 255.0f,
-                    ((c >> 8) & 0xFF) / 255.0f,
-                    (255 - (c & 0xFF)) / 255.0f,
-                }
+            struct pl_tex_transfer_params upload = {
+                .tex        = entry->tex,
+                .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
+                .row_pitch  = item->packed->stride[0],
+                .ptr        = item->packed->planes[0],
             };
-            entry->parts[entry->num_parts++] = part;
+            if (p->ra->gpu->limits.callbacks) {
+                upload.callback = talloc_free;
+                upload.priv = mp_image_new_ref(item->packed);
+            }
+            ok = pl_tex_upload(p->ra->gpu, &upload);
+            if (!ok) {
+                talloc_free(upload.priv);
+                mp_msg(p->log, MSGL_ERR, "Failed uploading OSD texture!\n");
+                break;
+            }
+
+            entry->num_parts = 0;
+            MP_TARRAY_GROW(p, entry->parts, item->num_parts);
+            for (int i = 0; i < item->num_parts; i++) {
+                const struct sub_bitmap *b = &item->parts[i];
+                if (b->dw == 0 || b->dh == 0)
+                    continue;
+                uint32_t c = b->libass.color;
+                entry->parts[entry->num_parts++] = (struct pl_overlay_part) {
+                    .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
+                    .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
+                    .color = {
+                        (c >> 24) / 255.0f,
+                        ((c >> 16) & 0xFF) / 255.0f,
+                        ((c >> 8) & 0xFF) / 255.0f,
+                        (255 - (c & 0xFF)) / 255.0f,
+                    },
+                };
+            }
+            entry->change_id = item->change_id;
         }
 
         // Create the final pl_overlay structure for rendering.
@@ -734,6 +748,16 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
                                &target_frame.color.hdr.prim);
     }
     pl_color_space_infer(&target_frame.color);
+
+    // Keep the pre-seek frame visible until a real post-seek frame arrives.
+    if (p->want_reset &&
+        (!frame || !frame->current || !frame->redraw))
+    {
+        ra_pl_reset(p->ra);
+        pl_queue_reset(p->queue);
+        p->last_pts = 0;
+        p->want_reset = false;
+    }
 
     // The libmpv VO provides one new frame at a time in frame->current.
     // We check the frame_id to avoid pushing duplicates.
@@ -901,7 +925,7 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
     pl_tex fbo = NULL;
 
     // Upload the mp_image to a pl_frame via the RA helper.
-    if (!ra_upload_mp_image(p->ra, &source_frame, frame->current)) {
+    if (!ra_upload_mp_image(p->ra, &source_frame, frame->current, NULL)) {
         mp_msg(p->log, MSGL_ERR, "pl_video_screenshot: failed to upload source image\n");
         return NULL;
     }
@@ -1028,10 +1052,7 @@ void pl_video_update_osd(struct pl_video *p, struct osd_state *osd) {
  */
 void pl_video_reset(struct pl_video *p) {
     if (!p || !p->ra) return;
-    ra_pl_reset(p->ra);
-    pl_queue_reset(p->queue); // Also reset the frame queue.
-    p->last_frame_id = 0;
-    p->last_pts = 0;
+    p->want_reset = true;
 }
 
 /**

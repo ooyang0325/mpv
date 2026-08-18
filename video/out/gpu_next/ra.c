@@ -149,7 +149,7 @@ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
  * @return True on success, false on failure.
  */
 bool ra_upload_mp_image(struct ra_next *ra, struct pl_frame *out_frame,
-                        const struct mp_image *img)
+                        const struct mp_image *img, pl_tex textures[4])
 {
     if (!img || !out_frame)
         return false;
@@ -177,17 +177,31 @@ bool ra_upload_mp_image(struct ra_next *ra, struct pl_frame *out_frame,
 
     out_frame->num_planes = planes;
 
-    // Upload each plane's pixel data to a new GPU texture.
+    // Upload each plane, reusing queue-owned textures when available.
     for (int n = 0; n < planes; n++) {
         data[n].width = mp_image_plane_w((struct mp_image *)img, n);
         data[n].height = mp_image_plane_h((struct mp_image *)img, n);
-        data[n].row_stride = img->stride[n];
-        data[n].pixels = img->planes[n];
+        if (img->stride[n] < 0) {
+            data[n].pixels = img->planes[n] +
+                             (data[n].height - 1) * img->stride[n];
+            data[n].row_stride = -img->stride[n];
+            out_frame->planes[n].flipped = true;
+        } else {
+            data[n].row_stride = img->stride[n];
+            data[n].pixels = img->planes[n];
+        }
 
-        // Let libplacebo handle the texture creation and data upload.
+        if (ra->gpu->limits.callbacks) {
+            data[n].callback = talloc_free;
+            data[n].priv = mp_image_new_ref((struct mp_image *)img);
+        }
+
+        pl_tex *texture = textures ? &textures[n]
+                                  : &out_frame->planes[n].texture;
         if (!pl_upload_plane(ra->gpu, &out_frame->planes[n],
-                             &out_frame->planes[n].texture, &data[n]))
+                             texture, &data[n]))
         {
+            talloc_free(data[n].priv);
             mp_msg(ra->log, MSGL_ERR, "Failed to upload mp_image plane %d\n", n);
             goto error;
         }
@@ -196,8 +210,8 @@ bool ra_upload_mp_image(struct ra_next *ra, struct pl_frame *out_frame,
     return true;
 
 error:
-    // Clean up any successfully created textures if one fails.
-    ra_cleanup_pl_frame(ra, out_frame);
+    if (!textures)
+        ra_cleanup_pl_frame(ra, out_frame);
     return false;
 }
 

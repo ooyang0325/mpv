@@ -117,6 +117,9 @@ struct priv {
     struct mp_frame *probe_packets; // packets retained while classifying the source
     int num_probe_packets;
     int probe_packet_pos;
+    struct mp_aframe_pool *pool;
+    float *samples;
+    size_t samples_capacity;
     /* Track-info codec profile (shift+I) for the spatial path. Two concerns:
      *
      *  - Lifetime: the core thread reads codec_profile from the track list
@@ -479,7 +482,17 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
         p->channels = (int)cur_ch;
     int ch = p->channels > 0 ? p->channels : 1;
     size_t capacity = (size_t)4096 * (size_t)ch;
-    float *samples = talloc_array(NULL, float, capacity);
+    if (capacity > p->samples_capacity) {
+        float *samples = talloc_realloc(p, p->samples, float, capacity);
+        if (!samples) {
+            MP_ERR(da, "failed to allocate spatial render buffer\n");
+            failed = true;
+            goto done;
+        }
+        p->samples = samples;
+        p->samples_capacity = capacity;
+    }
+    float *samples = p->samples;
 
     uintptr_t n_frames = 0;
     uint32_t n_ch = 0;
@@ -531,7 +544,6 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
         p->active_path = PATH_HOST;
         p->dl->overlay_set_rendering(0);
         p->dl->overlay_clear();
-        talloc_free(samples);
         process_host(da, p);
         return;
     }
@@ -612,7 +624,7 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
     mp_aframe_set_pts(out, pts);
 
     /* format + rate + chmap must be set before allocating the data buffer. */
-    if (!mp_aframe_alloc_data(out, n_frames)) {
+    if (mp_aframe_pool_allocate(p->pool, out, n_frames) < 0) {
         MP_ERR(da, "failed to allocate output frame (%zu frames, %u ch)\n",
                n_frames, n_ch);
         TA_FREEP(&out);
@@ -630,7 +642,6 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
     memcpy(data[0], samples, n_frames * (size_t)n_ch * sizeof(float));
 
 done:
-    talloc_free(samples);
     talloc_free(mpkt);
     if (out) {
         mp_pin_in_write(da->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
@@ -756,6 +767,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->log = da->log;
     p->codec = codec;
     p->sample_rate = codec->samplerate;
+    p->pool = mp_aframe_pool_create(p);
     p->active_path = PATH_NONE;
     p->source_spatial = codec_is_spatial_hint(codec);
     /* The hint is provisional: routing follows the *decoded* fact (the

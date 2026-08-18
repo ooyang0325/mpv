@@ -6,6 +6,7 @@
 #include "libplacebo/gpu.h"     // for pl_tex, pl_tex_params, pl_tex_t
 #include "mpv/client.h"         // for mpv_error
 #include "mpv/render.h"         // for mpv_render_param, mpv_render_param_type
+#include "mpv/render_gl.h"      // for mpv_opengl_fbo
 #include "ra.h"                 // for ra_next_tex_destroy
 #include "stdbool.h"            // for bool, false
 #include "string.h"             // for strcmp
@@ -275,15 +276,12 @@ static bool check_format(struct render_backend *ctx, int imgfmt)
  */
 static int get_target_size(struct render_backend *ctx, mpv_render_param *params, int *out_w, int *out_h)
 {
-    struct priv *p = ctx->priv;
-    if (!p->context || !p->context->fns || !p->context->ra) return MPV_ERROR_UNINITIALIZED;
-    pl_tex tex = NULL;
-    int err = p->context->fns->wrap_fbo(p->context, params, &tex);
-    if (err < 0) return err;
-    if (!tex) return MPV_ERROR_GENERIC;
-    *out_w = tex->params.w;
-    *out_h = tex->params.h;
-    pl_tex_destroy(p->context->ra->gpu, &tex);
+    mpv_opengl_fbo *fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
+    if (!fbo)
+        return MPV_ERROR_INVALID_PARAMETER;
+    *out_w = fbo->w;
+    *out_h = fbo->h;
     return 0;
 }
 

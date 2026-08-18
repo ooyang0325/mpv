@@ -19,7 +19,7 @@ struct ra_next {
  * Caller must call ra_cleanup_pl_frame() to free any textures created.
  * Returns true on success, false on failure. */
 bool ra_upload_mp_image(struct ra_next *ra, struct pl_frame *out_frame,
-                        const struct mp_image *img);
+                        const struct mp_image *img, pl_tex textures[4]);
 
 /* Cleanup any textures/resources attached to a pl_frame created by upload. */
 void ra_cleanup_pl_frame(struct ra_next *ra, struct pl_frame *frame);
